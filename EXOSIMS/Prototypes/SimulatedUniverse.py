@@ -39,6 +39,8 @@ class SimulatedUniverse(object):
             inclinations.
         commonSystemnEZ (bool):
             Assume same zodi for planets in the same system. Defaults to False.
+        fixed_nEZ_val (float):
+            A value representing the number of exozodi applied to *every* star.
         **specs:
             :ref:`sec:inputspec`
 
@@ -159,6 +161,7 @@ class SimulatedUniverse(object):
         commonSystemPlane=False,
         commonSystemPlaneParams=[0, 2.25, 0, 2.25],
         commonSystemnEZ=True,
+        fixed_nEZ_val=None,
         **specs,
     ):
         self.AU_div_day = u.AU / u.day
@@ -182,6 +185,9 @@ class SimulatedUniverse(object):
 
         # Set the number of exozodi
         self.commonSystemnEZ = commonSystemnEZ
+
+        # A fixed number of exozodi for every system
+        self.fixed_nEZ_val = fixed_nEZ_val
 
         # save fixed number of planets to generate
         self.fixedPlanPerStar = fixedPlanPerStar
@@ -361,7 +367,9 @@ class SimulatedUniverse(object):
             self.gen_M0()  # initial mean anomaly
             self.Mp = PPop.gen_mass(self.nPlans)  # mass
 
-        if self.commonSystemnEZ:
+        if self.fixed_nEZ_val is not None:
+            self.nEZ = np.ones((self.nPlans,)) * self.fixed_nEZ_val
+        elif self.commonSystemnEZ:
             # Assign the same nEZ to all planets in the system
             self.nEZ = ZL.gen_systemnEZ(TL.nStars)[self.plan2star]
         else:
