@@ -86,7 +86,7 @@ class coroOnlyScheduler(SurveySimulation):
         self.sInd_dettimes = {}
         # Minimum number of visits with no detections required to filter off star
         self.n_det_remove = n_det_remove
-        # Minimum number of detections required for promotio
+        # Minimum number of detections required for promotion
         self.n_det_min = n_det_min
         # Maximum allowed number of successful chars of deep dive targets before
         # removal from target list
