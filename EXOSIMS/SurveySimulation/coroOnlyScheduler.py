@@ -58,6 +58,7 @@ class coroOnlyScheduler(SurveySimulation):
         lum_exp=1,
         promote_by_time=False,
         detMargin=0.0,
+        n_fullspec_thresh=1,
         **specs
     ):
 
@@ -97,6 +98,7 @@ class coroOnlyScheduler(SurveySimulation):
         self.char_starVisits = np.zeros(TL.nStars, dtype=int)
         self.promote_by_time = promote_by_time
         self.detMargin = detMargin
+        self.n_fullspec_thresh = n_fullspec_thresh
 
         # self.revisit_wait = revisit_wait * u.d
         EEID = 1 * u.AU * np.sqrt(TL.L)
@@ -672,18 +674,23 @@ class coroOnlyScheduler(SurveySimulation):
 
         # revisit list, with time after start
         if np.any(char_sInds):
+            # Start with stars under visit limit
+            char_tovisit = np.zeros(self.TargetList.nStars, dtype=bool)
 
-            char_tovisit[char_sInds] = (
-                self.char_starVisits[char_sInds] < self.nVisitsMax
-            )
+            # Only consider stars that haven't exceeded visit limit
+            char_tovisit[char_sInds] = self.char_starVisits[char_sInds] < self.nVisitsMax
+            
+            # Filter out stars that aren't ready for revisit yet
             if self.char_starRevisit.size != 0:
-                dt_rev = TK.currentTimeNorm.copy() - self.char_starRevisit[:, 1] * u.day
-                ind_rev = [
-                    int(x)
-                    for x in self.char_starRevisit[dt_rev > self.zero_d, 0]
-                    if x in char_sInds
-                ]
-                char_tovisit[ind_rev] = self.char_starVisits[ind_rev] < self.nVisitsMax
+                # char_starRevisit's second column is the time when the star
+                # should be revisited and we don't want them in the
+                # char_tovisit list if currentTimeNorm < revisit time
+                is_too_early = TK.currentTimeNorm.to_value(u.d) < self.char_starRevisit[:, 1]
+                # Get stars with where the revisit time hasn't been reached
+                too_early_stars = self.char_starRevisit[is_too_early, 0].astype(int)
+                # Remove these from consideration
+                char_tovisit[too_early_stars] = False
+
             char_sInds = np.where(char_tovisit)[0]
 
         # 4.1 calculate integration times for ALL preselected targets
@@ -1083,10 +1090,10 @@ class coroOnlyScheduler(SurveySimulation):
 
         # look for last detected planets that have not been fully characterized
         if not (FA):  # only true planets, no FA
-            tochar = self.fullSpectra[mode_index][pIndsDet] == 0
+            tochar = self.fullSpectra[mode_index][pIndsDet] < self.n_fullspec_thresh
         else:  # mix of planets and a FA
             truePlans = pIndsDet[:-1]
-            tochar = np.append((self.fullSpectra[mode_index][truePlans] == 0), True)
+            tochar = np.append((self.fullSpectra[mode_index][truePlans] < self.n_fullspec_thresh), True)
 
         # 1/ find spacecraft orbital START position including overhead time,
         # and check keepout angle
@@ -1201,7 +1208,7 @@ class coroOnlyScheduler(SurveySimulation):
 
                 # finally, populate the revisit list (NOTE: sInd becomes a float)
                 t_rev = TK.currentTimeNorm.copy() + self.revisit_wait[sInd]
-                revisit = np.array([sInd, t_rev.to("day").value])
+                revisit = np.array([sInd, t_rev.to_value(u.d)])
                 if self.char_starRevisit.size == 0:
                     self.char_starRevisit = np.array([revisit])
                 else:
@@ -1359,6 +1366,22 @@ class coroOnlyScheduler(SurveySimulation):
             charplans = characterized[:-1] if FA else characterized
             self.fullSpectra[mode_index][pInds[charplans == 1]] += 1
             self.partialSpectra[mode_index][pInds[charplans == -1]] += 1
+            # After updating self.fullSpectra counts, enforce the threshold requirement
+            # loop over characterized planets (and FA if present)
+            for j, pInd in enumerate(pIndsDet):        
+                if pInd == -1:
+                    # skip false alarm entry
+                    continue  
+                # this planet got a full spectrum this observation
+                if characterized[j] == 1:              
+                    # Check if its total fullSpectra count has reached the threshold
+                    if self.fullSpectra[mode_index][pInd] < self.n_fullspec_thresh:
+                        # not yet fully characterized: mark as partial
+                        characterized[j] = -1          
+                    else:
+                        # threshold reached: remains fully characterized
+                        characterized[j] = 1           
+
 
         # in both cases (detection or false alarm), schedule a revisit
         smin = np.min(SU.s[pInds[det]])
@@ -1367,7 +1390,7 @@ class coroOnlyScheduler(SurveySimulation):
         # if target in promoted_stars list, schedule revisit based off of
         # semi-major axis
         if sInd in self.promoted_stars:
-            sp = np.min(SU.a[pInds[det]]).to("AU")
+            sp = np.min(SU.a[pInds[det]]).to(u.AU)
             if np.any(det):
                 pInd_smin = pInds[det][np.argmin(SU.a[pInds[det]])]
                 Mp = SU.Mp[pInd_smin]
@@ -1396,7 +1419,7 @@ class coroOnlyScheduler(SurveySimulation):
             t_rev = TK.currentTimeNorm.copy() + 0.75 * T
 
         # finally, populate the revisit list (NOTE: sInd becomes a float)
-        revisit = np.array([sInd, t_rev.to("day").value])
+        revisit = np.array([sInd, t_rev.to_value(u.day)])
         if self.char_starRevisit.size == 0:
             self.char_starRevisit = np.array([revisit])
         else:
@@ -1451,7 +1474,7 @@ class coroOnlyScheduler(SurveySimulation):
 
         # find indices of planets around the target
         pInds = np.where(SU.plan2star == sInd)[0]
-        JEZs = SU.scale_JEZ(sInd, mode)
+        # JEZs = SU.scale_JEZ(sInd, mode)
         dMags = SU.dMag[pInds]
         # WAs = SU.WA[pInds].to("arcsec").value
 
@@ -1479,10 +1502,10 @@ class coroOnlyScheduler(SurveySimulation):
 
         # look for last detected planets that have not been fully characterized
         if not (FA):  # only true planets, no FA
-            tochar = self.fullSpectra[mode_index][pIndsDet] == 0
+            tochar = self.fullSpectra[mode_index][pIndsDet] < self.n_fullspec_thresh
         else:  # mix of planets and a FA
             truePlans = pIndsDet[:-1]
-            tochar = np.append((self.fullSpectra[mode_index][truePlans] == 0), True)
+            tochar = np.append((self.fullSpectra[mode_index][truePlans] < self.n_fullspec_thresh), True)
 
         # 1/ find spacecraft orbital START position including overhead time,
         # and check keepout angle
