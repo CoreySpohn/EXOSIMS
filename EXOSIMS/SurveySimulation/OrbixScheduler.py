@@ -1,0 +1,3566 @@
+import time
+import warnings
+from bisect import insort
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Literal, Optional
+
+import astropy.units as u
+import jax.numpy as jnp
+import numpy as np
+from astropy.time import Time
+from intervaltree import Interval, IntervalTree
+from orbix.integrations.exosims import dMag0_grid
+from orbix.kepler.shortcuts import get_grid_solver
+
+from EXOSIMS.SurveySimulation.coroOnlyScheduler import coroOnlyScheduler
+
+warnings.filterwarnings("ignore", category=UserWarning, module="erfa")
+
+# Add matplotlib imports
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, to_rgba
+
+
+@dataclass
+class Target:
+    """Information on what we're pointing at."""
+
+    kind: str  # "star", "planet", "reference star"
+    sInd: int
+    pInd: Optional[int] = None
+    revisitNumber: Optional[int] = None
+    extra: Optional[dict] = None
+
+    @classmethod
+    def star(cls, sInd):
+        return cls("star", sInd=sInd)
+
+    @classmethod
+    def planet(cls, sInd, pInd):
+        return cls("planet", sInd=sInd, pInd=pInd)
+
+
+@dataclass(slots=True)
+class ObservationResult:
+    """
+    Output of do_detection / do_characterization.
+    `data` holds the numerics, `meta` holds identifiers needed for DRM.
+    """
+
+    data: dict[str, Any]
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    # ---- DRM serialization (one public entry‑point) ----------------
+    def to_drm(self):
+        if self.meta.get("purpose") == "detection":
+            return self._det_drm()
+        elif self.meta.get("purpose") == "characterization":
+            return self._char_drm()
+        else:
+            return {}
+
+    # Mirroring the detection DRM format
+    def _det_drm(self):
+        mode = self.data["det_mode"]
+        return {
+            "star_ind": self.meta["star_ind"],
+            "star_name": self.meta["star_name"],
+            "arrival_time": self.meta["arrival_time"],
+            "OB_nb": self.meta["OB_nb"],
+            "ObsNum": self.meta["ObsNum"],
+            "plan_inds": self.meta["plan_inds"],
+            "det_time": self.data["det_time"],
+            "det_status": self.data["det_status"],
+            "det_SNR": self.data["det_SNR"],
+            "det_fZ": self.data["det_fZ"],
+            "det_JEZ": self.data.get("det_JEZ"),
+            "det_dMag": self.data.get("det_dMag"),
+            "det_WA": self.data.get("det_WA"),
+            "det_params": self.data["det_params"],
+            "det_mode": mode,
+            "det_comp": self.data["det_comp"],
+        }
+
+    # Mirroring the characterization DRM format
+    def _char_drm(self):
+        return {
+            "star_ind": self.meta["star_ind"],
+            "star_name": self.meta["star_name"],
+            "arrival_time": self.meta["arrival_time"],
+            "OB_nb": self.meta["OB_nb"],
+            "ObsNum": self.meta["ObsNum"],
+            "plan_inds": self.meta["plan_inds"],
+            "char_info": self.data["char_info"],
+        }
+
+
+@dataclass
+class ScheduleAction:
+    """
+    Works like a reservation: tells the scheduler what, when, and for how long.
+    All fields are mandatory and immutable.
+    """
+
+    # timing
+    start: float  # absolute MJD
+    duration: float  # calendar time (intTime+overheads)
+
+    # planning information
+    purpose: Literal["detection", "characterization", "wait"]
+    # Target/observation information
+    target: Optional[Any] = None
+    mode: Optional[dict] = None
+    int_time: Optional[float] = None
+    # Whether we're doing a blind detection
+    blind: bool = False
+    comp: float = 0
+    pdet: float = 0
+    result: Optional[ObservationResult] = None
+
+    def __post_init__(self):
+        self.end = self.start + self.duration
+
+    def __lt__(self, other):
+        """Compare based on start time only."""
+        return self.start < other.start
+
+    def shift(self, dt: u.Quantity):
+        """Shift the reservation by a given number of days."""
+        return replace(self, start=self.start + dt)
+
+    # check if this reservation overlaps with another
+    def overlaps(self, other: "ScheduleAction"):
+        """Check if this reservation overlaps with another."""
+        return (self.start < other.end) and (self.end > other.start)
+
+    # req + dt
+    def __add__(self, dt: u.Quantity):
+        """Allows things like `req + 3` (always in days!)."""
+        return self.shift(dt)
+
+    # for dt + req
+    __radd__ = __add__
+
+
+@dataclass
+class Epoch:
+    """Per-epoch timing information for *all* stars."""
+
+    # "Now" e.g. TK.currentTimeNorm.to_value(u.day)
+    now_norm: float
+
+    # ndarray(nStars) of absolute start times (MJD, not including settling + det OH)
+    start_times_mjd: np.ndarray
+
+    # scalar overheads in days
+    det_oh: float
+    char_oh: float
+
+    # derived values
+    now_det: float = field(init=False)
+    now_char: float = field(init=False)
+    start_det: np.ndarray = field(init=False)
+    start_char: np.ndarray = field(init=False)
+
+    # ------------------------------------------------------------------
+    def __post_init__(self):
+        """Fill derived attributes after dataclass sets the fields."""
+        # same length as start_times_mjd but in mission‑elapsed days
+
+        # scalar "current time" for each mode
+        self.now_det = self.now_norm + self.det_oh
+        self.now_char = self.now_norm + self.char_oh
+
+        # derived values
+        self.start_det = self.start_times_mjd + self.det_oh
+        self.start_char = self.start_times_mjd + self.char_oh
+
+
+@dataclass
+class PlanetTrack:
+    """Per-planet tracking of expected orbital information."""
+
+    sInd: int
+    pInd: int
+    # index into err_progression
+    stage: int
+    last_obs_mjd: float
+    det_successes: int = 0
+    char_successes: int = 0
+    failures: int = 0
+
+    def ready_for_char(self, thresh):
+        """Helper to check if the planet track is ready for characterization."""
+        return self.det_successes >= thresh
+
+    def bump_detection(self):
+        """Call once each time this planet is positively detected."""
+        self.det_successes += 1
+        self.stage += 1
+
+    def bump_char(self):
+        """Call once each time this planet is positively characterized."""
+        self.char_successes += 1
+        self.stage += 1
+
+
+@dataclass
+class StarEnsemble:
+    """Class to track dynamic completeness for each star."""
+
+    sInd: int
+    # creation epoch (for propagation)
+    mjd0: float
+    # Boolean mask of orbits that haven't been ruled out
+    valid_orbits: np.ndarray
+    # total number of orbits drawn in OrbixCompleteness
+    n_orbits: int
+    # number of times we've failed to detect a planet around this star
+    n_failures: int = 0
+    # mjd of scheduled follow‑up
+    next_available_time: float | None = None
+    # fraction of remaining orbits that are valid
+    f_valid: float = 1.0
+    # dyn_comp_times
+    max_dyn_comp_int_time: float = 0.0
+
+
+class OrbixScheduler(coroOnlyScheduler):
+    """A scheduler that uses orbix to calculate the detection probability."""
+
+    def __init__(
+        self,
+        # err_progression=[0.2, 0.15, 0.05, 0.025, 0.01],
+        err_progression=[0.2, 0.1, 0.025],
+        followup_wait_d=15,
+        followup_horizon_d=500,
+        pdet_threshold=0.75,
+        required_det_successes=3,
+        required_char_successes=1,
+        max_char_failures=3,
+        max_det_failures=6,
+        min_comp_div_int_time=0.5,
+        min_int_time_hr=1,
+        debug_plots=False,
+        plot_format="png",
+        plot_dir=".",
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.err_progression = err_progression
+        # This is in days
+        self.followup_wait_d = followup_wait_d
+        self.followup_horizon_d = followup_horizon_d
+        # This is the threshold to consider pdet values for
+        self.required_det_successes = required_det_successes
+        self.required_char_successes = required_char_successes
+        self.pdet_threshold = pdet_threshold
+        self.max_char_failures = max_char_failures
+        self.max_det_failures = max_det_failures
+        self.min_comp_div_int_time = min_comp_div_int_time
+        self.min_int_time = min_int_time_hr * u.hr
+        self.min_int_time_d = self.min_int_time.to_value(u.day)
+        self.debug_plots = debug_plots
+        self.plot_format = plot_format
+        self.plot_dir = plot_dir
+
+        # Create schedule/history observation lists
+        # This format ensures that the schedule is always sorted
+        self.schedule: list[ScheduleAction] = []
+        self._itr = IntervalTree()
+        self.history: list[ScheduleAction] = []
+
+        # Create the planet tracks
+        # Indexed by (sInd, pInd)
+        self.planet_tracks = {}
+        self.retired_tracks = {}
+
+        self.to_requeue = []
+
+        # Track all planets detected throughout the mission
+        self._all_detected_planets = set()
+
+        # Track planets that have completed full characterization
+        self._completed_planets = set()
+
+        # Initialize mission statistics tracking
+        self._prev_mission_stats = None
+
+        # Create the star ensembles
+        self.star_ensembles = {}
+
+        self.promotion_times = {}
+        # choose observing modes selected for detection (default marked with a flag)
+        self.select_default_observing_modes()
+
+        # Initialize all the orbix things
+        self.setup_orbix()
+
+    def initializeStorageArrays(self):
+        """
+        Initialize all storage arrays based on # of stars and targets
+        """
+
+        self.DRM = []
+        OS = self.OpticalSystem
+        SU = self.SimulatedUniverse
+        allModes = OS.observingModes
+        num_char_modes = len(
+            list(filter(lambda mode: "spec" in mode["inst"]["name"], allModes))
+        )
+        self.fullSpectra = np.zeros((num_char_modes, SU.nPlans), dtype=int)
+        self.partialSpectra = np.zeros((num_char_modes, SU.nPlans), dtype=int)
+        self.propagTimes = np.zeros(self.TargetList.nStars) << u.d
+        self.lastObsTimes = np.zeros(self.TargetList.nStars) << u.d
+        # contains the number of times each star was visited
+        self.starVisits = np.zeros(self.TargetList.nStars, dtype=int)
+        self.det_starVisits = np.zeros(self.TargetList.nStars, dtype=int)
+        self.char_starVisits = np.zeros(self.TargetList.nStars, dtype=int)
+        self.starRevisit = np.array([])
+        self.starExtended = np.array([], dtype=int)
+        self.lastDetected = np.empty((self.TargetList.nStars, 4), dtype=object)
+
+    def setup_orbix(self):
+        """Create necessary Orbix objects."""
+        OS, SU = self.OpticalSystem, self.SimulatedUniverse
+        t0 = self.min_int_time
+        tf = OS.intCutoff
+        int_times = (
+            np.logspace(np.log10(t0.to_value(u.hr)), np.log10(tf.to_value(u.hr)), 50)
+            << u.hr
+        )
+        nEZs = np.array([SU.fixed_nEZ_val])
+        self.dMag0s = {}
+        self.solver = get_grid_solver(
+            level="planet", jit=False, kind="bilinear", E=False, trig=True
+        )
+        for mode in OS.observingModes:
+            self.dMag0s[mode["hex"]] = dMag0_grid(self, mode, int_times, nEZs)
+
+        # Set up orbix completeness
+        self.Completeness.orbix_setup(self.solver, self)
+
+    def run_sim(self) -> None:
+        """
+        Top-level DRM simulation loop that passes ObservationTarget objects in
+        and ObservationRecord objects out.
+        """
+        TK = self.TimeKeeping
+
+        # begin survey, and loop until mission is finished
+        t0 = time.time()
+        self.ObsNum = 0
+
+        from pyinstrument import Profiler
+
+        profiler = Profiler()
+        profiler.start()
+        while True:
+            # Next target just adds an observation to the schedule (if necessary)
+            self.next_action()
+
+            if len(self.schedule) == 0:
+                # No more observations could be scheduled
+                break
+
+            # Get the next action from the schedule
+            action = self.schedule.pop(0)
+            _interval = Interval(
+                float(action.start),
+                float(action.end),
+                (action.purpose, action.target),
+            )
+            self._itr.remove(_interval)
+
+            # Advance to the action's start time
+            if TK.currentTimeAbs.mjd < action.start:
+                TK.advanceToAbsTime(
+                    Time(action.start, format="mjd"), addExoplanetObsTime=False
+                )
+
+            # Check if the action would violate the mission duration
+            if TK.currentTimeAbs.mjd + action.duration > TK.missionFinishAbs.mjd:
+                break
+
+            # Perform the action
+            if action.purpose == "detection":
+                # Get the result of the detection and add it to the observation
+                action.result = self.do_detection(action)
+            elif action.purpose == "characterization":
+                action.result = self.do_characterization(action)
+            elif action.purpose == "general_astrophysics":
+                # NOTE: I maintain that this is funny
+                # action.result = self.do_worthless_observation(action)
+                pass
+
+            # Update time to end of the action
+            if (action.end - TK.currentTimeAbs.mjd) > 1e-6:
+                TK.advanceToAbsTime(
+                    Time(action.end, format="mjd"), addExoplanetObsTime=False
+                )
+
+            # Respond to the action's result
+            self.respond(action)
+            self.log_obs(action)
+
+        # Mission is complete
+        dtsim = (time.time() - t0) * u.s
+        log_end = (
+            "Mission complete: no more time available.\n"
+            + "Simulation duration: %s.\n" % dtsim.astype("int")
+            + "Results stored in SurveySimulation.DRM (Design Reference Mission)."
+        )
+        self.logger.info(log_end)
+        self.vprint(log_end)
+
+        # Generate final schedule plot after mission completes
+        self.plot_final_schedule()
+        profiler.stop()
+        profiler.open_in_browser()
+
+    def plot_final_schedule(self):
+        """
+        Creates a final visualization showing all detected planets and their observations over time.
+        Each planet is represented as a row, with detection and characterization events shown as markers.
+        Planets are ordered by their first detection time.
+
+        The plot will be saved to the directory specified by self.plot_dir with the
+        format specified by self.plot_format.
+        """
+
+        # Create the plot directory if it doesn't exist
+        if not Path(self.plot_dir).exists():
+            Path(self.plot_dir).mkdir(parents=True, exist_ok=True)
+        if not self.history:
+            self.logger.info("No observations to plot")
+            return
+
+        # Extract all planet observations from history
+        planet_observations = {}  # {(sInd, pInd): [observation_actions]}
+        detection_times = {}  # {(sInd, pInd): first_detection_time}
+        star_names = {}  # {(sInd, pInd): star_name}
+        star_blind_observations = {}  # {(sInd): [blind_actions]}
+
+        # Process history to find all planet observations and their first detection times
+        for action in self.history:
+            if action.blind:
+                if action.target.sInd not in star_blind_observations:
+                    star_blind_observations[action.target.sInd] = []
+                star_blind_observations[action.target.sInd].append(action)
+        remove_from_blind = set()
+        for action in self.history:
+            if action.target and action.target.kind == "planet" and action.result:
+                key = (action.target.sInd, action.target.pInd)
+
+                # Store star name
+                star_names[key] = self.TargetList.Name[action.target.sInd]
+
+                # Initialize list if this is the first observation of this planet
+                if key not in planet_observations:
+                    if action.target.sInd in star_blind_observations:
+                        # Add the blind observations for this star
+                        planet_observations[key] = star_blind_observations[
+                            action.target.sInd
+                        ]
+                        remove_from_blind.add(action.target.sInd)
+                    else:
+                        planet_observations[key] = []
+
+                # Add this observation to the planet's list
+                planet_observations[key].append(action)
+
+                # If this is a detection and it's successful, track the time
+                if action.purpose == "detection":
+                    detected = action.result.data.get("det_status", [])
+                    if np.any(detected > 0) and key not in detection_times:
+                        detection_times[key] = action.start
+
+        for sInd in remove_from_blind:
+            del star_blind_observations[sInd]
+        # Create a list of all remaining blind observations
+        remaining_blind_observations = []
+        remaining_blind_stars = len(star_blind_observations.keys()) - len(
+            remove_from_blind
+        )
+        for sInd in star_blind_observations:
+            remaining_blind_observations.extend(star_blind_observations[sInd])
+
+        if not planet_observations:
+            self.logger.info("No planet observations to plot")
+            return
+
+        # Sort planets by their first detection time
+        sorted_planet_keys = sorted(
+            detection_times.keys(),
+            key=lambda k: detection_times.get(k, float("inf")),
+        )
+
+        # Create the plot
+        fig, ax = plt.subplots(
+            figsize=(14, max(10, len(sorted_planet_keys) * 0.4)),
+            constrained_layout=True,
+        )
+
+        # Create a mapping from planet keys to row positions
+        # Invert the row positions so the first detected planet is at the top
+        planet_positions = {
+            key: len(sorted_planet_keys) - 1 - i
+            for i, key in enumerate(sorted_planet_keys)
+        }
+
+        # Add a row for blind observations
+        planet_positions[(None, None)] = len(sorted_planet_keys)
+
+        # Define a color scheme
+        colors = {
+            "detection": "#3498db",  # Blue
+            "characterization": "#2ecc71",  # Green
+            "failed_detection": "#e74c3c",  # Red
+            "failed_characterization": "#f39c12",  # Orange
+            "blind_observation": "#9b59b6",  # Purple
+        }
+
+        # Get mission time range
+        mission_start = self.TimeKeeping.missionStart.mjd
+        mission_end = self.TimeKeeping.missionFinishAbs.mjd
+        mission_duration_years = (mission_end - mission_start) / 365.25
+
+        # Set the plot limits using MJD directly
+        ax.set_xlim(mission_start, mission_end)
+        ax.set_ylim(-0.5, len(sorted_planet_keys) + 0.5)
+
+        # Add grid lines
+        ax.grid(True, alpha=0.3, linestyle="--")
+
+        # Add mission progress lines (25%, 50%, 75%)
+        progress_times = [
+            mission_start + (mission_end - mission_start) * 0.25,
+            mission_start + (mission_end - mission_start) * 0.50,
+            mission_start + (mission_end - mission_start) * 0.75,
+        ]
+        progress_labels = ["25%", "50%", "75%"]
+
+        for time, label in zip(progress_times, progress_labels):
+            ax.axvline(x=time, color="purple", linestyle="--", alpha=0.7)
+            # Add the label at the top of the plot
+            ax.text(
+                time,
+                -0.5,
+                label,
+                ha="center",
+                va="top",
+                color="purple",
+                bbox=dict(facecolor="white", alpha=0.8, pad=2),
+            )
+
+        # Plot each planet's observations
+        for key in sorted_planet_keys:
+            row = planet_positions[key]
+
+            # Plot a horizontal line for this planet's timeline
+            ax.axhline(y=row, color="gray", alpha=0.3, linestyle="-")
+
+            for action in planet_observations[key]:
+                # Determine if the observation was successful
+                successful = False
+                if action.blind:
+                    color = colors["blind_observation"]
+                    det_status = action.result.data.get("det_status", [])
+                    if len(det_status) > 0 and np.any(det_status > 0):
+                        successful = True
+                    marker = "d"
+                    alpha = action.comp
+                else:
+                    if action.purpose == "detection":
+                        det_status = action.result.data.get("det_status", [])
+                    if len(det_status) > 0 and np.any(det_status > 0):
+                        successful = True
+                    elif action.purpose == "characterization":
+                        if action.result.data.get("char_info") and np.any(
+                            action.result.data["char_info"][-1].get("char_status", [])
+                        ):
+                            successful = True
+
+                    # Choose the right color based on observation type and success
+                    if action.purpose == "detection":
+                        color = (
+                            colors["detection"]
+                            if successful
+                            else colors["failed_detection"]
+                        )
+                    else:  # characterization
+                        color = (
+                            colors["characterization"]
+                            if successful
+                            else colors["failed_characterization"]
+                        )
+
+                    # Add a marker for this observation
+                    alpha = action.pdet
+                    marker = "o" if successful else "x"
+
+                # Convert color to RGBA and apply alpha only to face color
+                face_color = to_rgba(color, alpha)
+                edge_color = to_rgba(color, 1.0)  # Solid edge
+
+                # Plot markers with solid borders but transparent fills
+                ax.plot(
+                    action.start,
+                    row,
+                    marker,
+                    markerfacecolor=face_color,  # Apply alpha to face color only
+                    markeredgecolor=edge_color,  # Solid edge color
+                    markersize=8,
+                )
+
+                # Add a line representing the duration of the observation
+                if action.duration > 0:
+                    ax.plot(
+                        [action.start, action.start + action.duration],
+                        [row, row],
+                        "-",
+                        color=color,
+                        linewidth=2,
+                        alpha=0.6,
+                    )
+        # Plot the remaining blind observations
+        blind_color = colors["blind_observation"]
+        for action in remaining_blind_observations:
+            _alpha = action.comp
+            ax.plot(
+                action.start,
+                planet_positions[(None, None)],
+                "d",
+                color=blind_color,
+                markersize=8,
+                alpha=_alpha,
+            )
+
+        # Add y-axis labels with planet information
+        planet_labels = []
+        prev_star = None
+        star_boundaries = []  # To store rows where star systems change
+
+        # We need to create labels in the same order as the positions (inverted)
+        for i, key in enumerate(reversed(sorted_planet_keys)):
+            sInd, pInd = key
+
+            # Track star system changes for visual grouping
+            current_star = self.TargetList.Name[sInd]
+            if prev_star is not None and current_star != prev_star:
+                # Add boundary between different stars - adjusted for reversed order
+                star_boundaries.append(i - 0.5)
+            prev_star = current_star
+
+            a = self.SimulatedUniverse.a[pInd].to_value(u.AU)  # Semi-major axis
+            radius = self.SimulatedUniverse.Rp[pInd].to_value(u.earthRad)
+            # Format the label with planet properties
+            label = f"S{sInd} - P{pInd} ({radius:.1f} R⊕, {a:.2f} AU)"
+
+            planet_labels.append(label)
+
+        # Add boundary between stars and blind observations
+        star_boundaries.append(len(sorted_planet_keys) - 0.5)
+
+        planet_labels.append(
+            (
+                f"Other blind observations ({len(remaining_blind_observations)} obs,"
+                f" {remaining_blind_stars} stars)"
+            )
+        )
+
+        ax.set_yticks(range(len(sorted_planet_keys) + 1))
+        ax.set_yticklabels(planet_labels)
+
+        # Add horizontal lines to visually separate star systems
+        for boundary in star_boundaries:
+            ax.axhline(y=boundary, color="black", linestyle="-", alpha=0.5, linewidth=1)
+
+        # Format the x-axis as dates - convert MJD to calendar dates
+        # Using astropy.time to handle MJD conversions
+        from astropy.time import Time
+
+        # Function to convert MJD to matplotlib dates
+        def mjd_to_matplotlib_date(mjd):
+            return mjd - 40587.0  # Offset between MJD and matplotlib date system
+
+        # Convert major tick locations from MJD to matplotlib dates
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=30))  # Monthly ticks
+        ax.xaxis.set_minor_locator(mdates.DayLocator(interval=7))  # Weekly minor ticks
+
+        # Use a FuncFormatter to convert MJD to readable dates
+        def mjd_date_formatter(x, pos):
+            try:
+                t = Time(x, format="mjd")
+                return t.datetime.strftime("%Y-%m-%d")
+            except:
+                return str(x)  # Fallback if conversion fails
+
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(mjd_date_formatter))
+
+        # Rotate date labels for better readability
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+
+        # Add mission summary information as text box
+        stats, _ = self.get_mission_stats()
+        summary_text = (
+            f"Mission Summary:\n"
+            f"Duration: {mission_duration_years:.1f} years\n"
+            f"Total planets detected: {stats['detected_planets']}/{stats['total_planets']}\n"
+            f"Unique stars observed: {stats['total_stars_visited']}\n"
+            f"Planets characterized: {stats['chars_completed']}\n"
+            f"Total observations: {stats['total_observations']}\n"
+            f"Observation time used: {stats['used_time']:.1f}/{stats['total_time']:.1f} days ({stats['percent_used']:.1f}%)"
+        )
+
+        # Add the summary text box
+        props = dict(boxstyle="round", facecolor="white", alpha=0.8)
+        ax.text(
+            0.02,
+            0.02,
+            summary_text,
+            transform=ax.transAxes,
+            fontsize=10,
+            verticalalignment="bottom",
+            bbox=props,
+        )
+
+        # Add a legend
+        legend_elements = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                markerfacecolor=colors["detection"],
+                label="Detection",
+                markersize=10,
+            ),
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                markerfacecolor=colors["characterization"],
+                label="Characterization",
+                markersize=10,
+            ),
+            plt.Line2D(
+                [0],
+                [0],
+                marker="x",
+                color=colors["failed_detection"],
+                label="Failed Detection",
+                markersize=10,
+            ),
+            plt.Line2D(
+                [0],
+                [0],
+                marker="x",
+                color=colors["failed_characterization"],
+                label="Failed Characterization",
+                markersize=10,
+            ),
+            plt.Line2D(
+                [0],
+                [0],
+                marker="d",
+                color=colors["blind_observation"],
+                label="Blind Observation",
+                markersize=10,
+            ),
+        ]
+        ax.legend(handles=legend_elements, loc="best")
+
+        # Add title and labels
+        ax.set_title("Mission Observation Schedule", fontsize=16)
+        ax.set_xlabel("Date", fontsize=12)
+        ax.set_ylabel("Planets", fontsize=12)
+
+        # Save the figure
+        plot_path = Path(self.plot_dir, f"mission_schedule.{self.plot_format}")
+        fig.savefig(plot_path, dpi=300, bbox_inches="tight")
+        self.logger.info(f"Final schedule plot saved to {plot_path}")
+        self.vprint(f"Final schedule plot saved to {plot_path}")
+
+    def respond(self, action):
+        """
+        Called after *every* observation.  Adds future ScheduleActions for
+        planet follow-up as needed.
+        """
+        if action.purpose == "detection" and not action.result.data["det_status"].any():
+            # No detection, completeness based response
+            self._process_nondetection(action)
+        elif action.purpose == "detection":
+            self._process_detection(action)
+        elif action.purpose == "characterization":
+            self._process_characterization(action)
+
+    def _process_nondetection(self, action: ScheduleAction) -> None:
+        sInd = action.target.sInd
+        TK, Comp = self.TimeKeeping, self.Completeness
+        # There are two cases here, a blind target or a known target
+        if action.target.kind == "star":
+            ens = self.star_ensembles.get(sInd)
+            # Blind target
+            if ens is None:
+                # Create a new StarEnsemble object for this star
+                # Currently OrbixCompleteness just sets t0 to 0
+                ens = self.star_ensembles[sInd] = StarEnsemble(
+                    sInd=sInd,
+                    mjd0=0,
+                    valid_orbits=np.ones(self.Completeness.Nplanets, dtype=bool),
+                    n_orbits=self.Completeness.Nplanets,
+                )
+            else:
+                # Update the ensemble's mask and fraction of valid orbits
+                ens.n_failures += 1
+                if ens.n_failures > self.nVisitsMax:
+                    # give up on this star
+                    self.ignore_stars.append(sInd)
+                    return
+
+            _dMag0Grid = self.dMag0s[action.result.data["det_mode"]["hex"]][sInd]
+            # Get closest time to the observation in our pre-computed s/dMag values
+            t_ind = (
+                np.searchsorted(
+                    Comp.comp_times,
+                    TK.currentTimeNorm.to_value(u.day),
+                    side="right",
+                )
+                - 1
+            )
+            alphas = Comp.s[:, t_ind].reshape(-1, 1) * Comp.alpha_factors[sInd]
+            dMags = Comp.dMag[:, t_ind].reshape(-1, 1)
+            fZ = jnp.array([action.result.data["det_fZ"].to_value(self.fZ_unit)])
+            mask = _dMag0Grid.alpha_dMag_mask(self.solver, alphas, dMags, fZ)
+
+            # Get the closest int_time to the observation's int_time
+            int_time_ind = np.searchsorted(_dMag0Grid.int_times, action.int_time)
+
+            # Get the mask for the used int_time
+            mask = mask[:, 0, int_time_ind]
+
+            # Update the ensemble's mask and fraction of valid orbits
+            ens.valid_orbits &= ~mask
+            ens.f_valid = ens.valid_orbits.sum() / ens.n_orbits
+
+            # Forecast the dynamic completeness values for 1000 days
+            dtimes = TK.currentTimeNorm.to_value(u.day) + jnp.linspace(
+                0, 1000, 100, endpoint=False
+            )
+            fZMap = self.ZodiacalLight.fZMap[self.base_det_mode["syst"]["name"]]
+            fZ_inds = (
+                np.searchsorted(
+                    self.koTimes_mjd, dtimes + TK.missionStart.mjd, side="right"
+                )
+                - 1
+            )
+            fZ = jnp.float32(fZMap[sInd, fZ_inds])
+            comp_t_inds = (
+                np.searchsorted(
+                    Comp.comp_times,
+                    dtimes,
+                    side="right",
+                )
+                - 1
+            )
+            alphas = Comp.s[:, comp_t_inds] * Comp.alpha_factors[sInd]
+            dMags = Comp.dMag[:, comp_t_inds]
+            # This calculates the dynamic completeness as a function of
+            # integration time
+            dyn_comp_div_intTime = np.array(
+                _dMag0Grid.dyn_comp_vec(
+                    self.solver, alphas, dMags, fZ, ens.valid_orbits
+                )
+            )
+            # For each obs time, get the maximum dynamic completeness value
+            # and the integration time that gives it
+            max_dyn_comp_inds = np.argmax(dyn_comp_div_intTime, axis=1)
+            ens.best_int_times = np.array(_dMag0Grid.int_times)[max_dyn_comp_inds]
+            ens.best_comp_div_intTime = np.array(dyn_comp_div_intTime)[
+                np.arange(dyn_comp_div_intTime.shape[0]), max_dyn_comp_inds
+            ]
+            ens.times = np.array(dtimes)
+            # Get the first time where the comp/int_time is > 0.5 of the max
+            # This is just a simple way to avoid making a bunch of immediate
+            # revisit observations
+            max_remaining = ens.best_comp_div_intTime.max()
+            remaining_times = ens.times[ens.best_comp_div_intTime > 0.5 * max_remaining]
+            first_available_time = remaining_times[0]
+            ens.next_available_time = first_available_time
+        else:
+            # Known target, update the planet tracks and queue follow-up
+            for track in list(self._tracks_for_star(sInd)):
+                track.failures += 1
+                track.last_obs_mjd = TK.currentTimeAbs.mjd
+
+                if track.failures > self.max_det_failures:
+                    # give up on this planet
+                    del self.planet_tracks[(track.sInd, track.pInd)]
+                    self.logger.info(
+                        f"Dropping planet ({track.sInd},{track.pInd})"
+                        f" after {track.failures} failed re-detections."
+                    )
+                    continue
+
+                # Otherwise update the orbit and schedule another attempt
+                self._update_orbit(track)
+                self._queue_followup(track, action)
+
+    def _process_detection(self, action: ScheduleAction) -> None:
+        """Create tracks for new detections and queue their follow-up."""
+        sInd = action.target.sInd
+        detected = action.result.data["det_status"]
+
+        plan_inds = action.result.meta["plan_inds"][detected.astype(bool)]
+
+        _time = self.TimeKeeping.currentTimeAbs.mjd
+        for pInd in plan_inds:
+            key = (sInd, int(pInd))
+            if key in self.retired_tracks:
+                continue
+            # Add to the set of all detected planets
+            self._all_detected_planets.add(key)
+
+            track = self.planet_tracks.get(key)
+            if track is None:
+                track = self.planet_tracks[key] = PlanetTrack(
+                    sInd=sInd, pInd=int(pInd), stage=0, last_obs_mjd=_time
+                )
+
+            track.last_obs_mjd = _time
+            # Improve orbital estimate with error progression
+            self._update_orbit(track)
+            track.bump_detection()
+            self._queue_followup(track, action)
+
+    def _process_characterization(self, action: ScheduleAction) -> None:
+        """Advance or retry tracks depending on success."""
+        sInd = action.target.sInd
+        # Was this characterization successful?
+        # Last char_info entry has 'char_status' array in the same order
+        char_status = action.result.data["char_info"][-1]["char_status"]
+        plan_inds = action.result.meta["plan_inds"]
+
+        for pInd, status in zip(plan_inds, char_status):
+            key = (sInd, int(pInd))
+            if key not in self.planet_tracks:
+                continue
+
+            track = self.planet_tracks[key]
+            track.last_obs_mjd = self.TimeKeeping.currentTimeAbs.mjd
+
+            self._update_orbit(track)
+            if status == 1:
+                # Successful characterization
+                track.bump_char()
+                track.failures = 0
+
+                self.logger.info(
+                    f"CHAR DEBUG: Successful characterization for planet ({sInd},{pInd}). "
+                    f"Successes now {track.char_successes}/{self.required_char_successes}"
+                )
+
+                if track.char_successes < self.required_char_successes:
+                    self._update_orbit(track)
+                    self._queue_followup(track, action)
+                else:
+                    # Planet is fully characterized
+                    if not hasattr(self, "_completed_planets"):
+                        self._completed_planets = set()
+
+                    # Add detailed logging for characterization completion
+                    self.logger.info(
+                        f"CHAR DEBUG: Planet ({sInd},{pInd}) has been fully characterized with "
+                        f"{track.char_successes}/{self.required_char_successes} successful characterizations. "
+                        f"Removing from active tracking."
+                    )
+
+                    # Add to completed set
+                    self._completed_planets.add(key)
+
+                    # Remove from planet_tracks to prevent further scheduling
+                    self._retire_track(track)
+
+                    # Check if this was the last planet for this star
+                    remaining_planets_for_star = [
+                        t for t in self.planet_tracks.values() if t.sInd == sInd
+                    ]
+
+                    # Only add to ignore_stars if this was the last planet for this star
+                    # AND if we want to ignore stars after characterization
+                    if not remaining_planets_for_star and hasattr(self, "ignore_stars"):
+                        self.logger.info(
+                            f"CHAR DEBUG: No more planets to track for star {sInd}. Adding to ignore list."
+                        )
+                        if sInd not in self.ignore_stars:
+                            self.ignore_stars.append(sInd)
+            else:
+                # Failed characterization
+                track.failures += 1
+                self.logger.info(
+                    f"CHAR DEBUG: Failed characterization for planet ({sInd},{pInd}). "
+                    f"Failures now {track.failures}/{self.max_char_failures}"
+                )
+
+                if track.failures <= self.max_char_failures:
+                    self._queue_followup(track, action)
+                else:
+                    self.logger.info(
+                        f"CHAR DEBUG: Giving up on characterizing planet ({sInd},{pInd}) after "
+                        f"{track.failures} failed attempts."
+                    )
+                    # Remove the planet from tracking after too many failures
+                    self._retire_track(track)
+
+    def _update_orbit(self, track):
+        """Update the orbit of the given planet track."""
+        stage = np.clip(track.stage, 0, len(self.err_progression) - 1)
+        self.SimulatedUniverse.create_orbix_planets(
+            track.pInd,
+            self.TimeKeeping,
+            self,
+            err=self.err_progression[stage],
+            norb=500,
+        )
+
+    def _queue_followup(self, track, prev_action):
+        """Create a follow up observation for the given planet track."""
+        # Use the planet's generated orbix planets to forecast the best time to observe
+        _do_char = track.ready_for_char(self.required_det_successes)
+        if _do_char:
+            purpose = "characterization"
+            mode = self.base_char_mode
+            self.logger.info(
+                f"CHAR DEBUG: Attempting to schedule characterization for planet ({track.sInd},{track.pInd}) "
+                f"with detection successes={track.det_successes}/{self.required_det_successes}"
+            )
+        else:
+            purpose = "detection"
+            mode = self.base_det_mode
+
+        # Check if there's already a scheduled follow-up for this planet and cancel it
+        for _action in self.schedule:
+            if _action.target.sInd == track.sInd and _action.target.pInd == track.pInd:
+                # This usually occurs when a planet was detected by an observation that
+                # was targeting a different planet. So we can cancel the follow-up
+                # as long as it was the same kind of observation (char vs det)
+                if _action.purpose == purpose:
+                    self._remove_action(_action)
+
+        # Define a sequence of progressively lower thresholds to try
+        threshold_multipliers = [1.0, 1.0, 0.9, 0.5, 0.25]
+        t_start, int_time, max_pdet = None, None, 0
+        horizon_multipliers = [1, 3, 5, 10, 10]
+
+        # Try each threshold until we find a valid observation or exhaust all options
+        for threshold_multiplier, horizon_multiplier in zip(
+            threshold_multipliers, horizon_multipliers
+        ):
+            current_threshold = self.pdet_threshold * threshold_multiplier
+            current_horizon = self.followup_horizon_d * horizon_multiplier
+            t_start, int_time, max_pdet, pdet_val = self._calc_optimal_followup(
+                track, current_threshold, mode, current_horizon
+            )
+            if t_start is not None:
+                # Found a valid observation, break out of the loop
+                self.logger.info(
+                    f"Scheduling follow-up for planet ({track.sInd},{track.pInd}) "
+                    f"with threshold {current_threshold:.3f} (original: {self.pdet_threshold:.3f})"
+                )
+                break
+
+        # If all thresholds failed, retire the planet
+        if t_start is None:
+            self._retire_track(track)
+            return
+
+        oh = (mode["syst"]["ohTime"] + self.Observatory.settlingTime).to_value(u.day)
+
+        action = ScheduleAction(
+            start=t_start,
+            duration=int_time + oh,
+            purpose=purpose,
+            target=Target.planet(track.sInd, track.pInd),
+            mode=mode,
+            int_time=int_time,
+            blind=False,
+            pdet=float(pdet_val),
+        )
+        self._add_action(action)
+        while self.to_requeue:
+            act = self.to_requeue.pop(0)
+            if act.target and act.target.kind == "planet":
+                tr = self.planet_tracks.get((act.target.sInd, act.target.pInd))
+                if tr is not None:
+                    self._queue_followup(tr, act)
+        if _do_char:
+            self.logger.info(
+                f"CHAR DEBUG: Successfully scheduled characterization for planet ({track.sInd},{track.pInd}) "
+                f"at MJD {t_start:.2f} with int_time={int_time:.2f} days"
+            )
+
+    def _calc_optimal_followup(self, track, threshold, mode, horizon):
+        """Calculate the optimal follow-up time for the given planet track."""
+        is_char = mode == self.base_char_mode
+        debug_prefix = "CHAR DEBUG: " if is_char else ""
+
+        TK, ZL = self.TimeKeeping, self.ZodiacalLight
+        _dMag0Grid = self.dMag0s[mode["hex"]][track.sInd]
+        planets = self.SimulatedUniverse.orbix_planets[track.pInd]
+        # Get the best time to observe
+        current_time = TK.currentTimeNorm.to_value(u.day)
+        max_end_time = TK.missionLife_d - _dMag0Grid.int_times[0]
+        t0 = current_time + self.followup_wait_d
+        tf = np.min([t0 + horizon, max_end_time])
+        prop_times = jnp.linspace(t0, tf, 250, endpoint=False)
+        prop_times_mjd = prop_times + TK.missionStart.mjd
+        # Get the fZ values from fZMap
+        fZ_inds = np.searchsorted(self.koTimes_mjd, prop_times_mjd, side="right") - 1
+        fZMap = ZL.fZMap[self.base_det_mode["syst"]["name"]]
+        fZ = fZMap[track.sInd, fZ_inds]
+        # Shape is (n_times, n_int_times)
+        _int_times = _dMag0Grid.int_times
+        _pdet = np.array(
+            _dMag0Grid.pdet_planets(self.solver, prop_times, planets, jnp.array(fZ))
+        )
+        max_pdet = np.max(_pdet)
+
+        if is_char:
+            self.logger.info(
+                f"{debug_prefix}Calculating optimal followup for planet ({track.sInd},{track.pInd}): "
+                f"max_pdet={max_pdet:.3f}, threshold={threshold:.3f}, purpose={'characterization' if is_char else 'detection'}"
+            )
+
+        # If max_pdet is below threshold, fail early
+        if max_pdet < threshold:
+            if is_char:
+                self.logger.warning(
+                    f"{debug_prefix}Max pdet {max_pdet:.3f} < threshold {threshold:.3f}, failing early"
+                )
+
+                # Create debug plot for failed scheduling attempt
+                if hasattr(self, "debug_plots") and self.debug_plots:
+                    self._plot_scheduling_attempt(
+                        track,
+                        prop_times,
+                        _int_times,
+                        _pdet,
+                        threshold,
+                        mode,
+                        ko_status=None,
+                        schedule_conflicts=None,
+                        time_limits=None,
+                        mission_limits=None,
+                        result="threshold_failure",
+                    )
+
+            return None, None, max_pdet, None
+
+        pdet = _pdet.copy()
+        pdet[pdet < threshold] = 0
+
+        # Keepout filter
+        overhead_days = (
+            mode["syst"]["ohTime"] + self.Observatory.settlingTime
+        ).to_value(u.day)
+        ko_mask = np.zeros((len(prop_times_mjd), len(_int_times)), dtype=bool)
+        mission_finish_mjd = (
+            self.TimeKeeping.missionFinishAbs.mjd
+        )  # Get mission end for boundary
+
+        # Iterate over each candidate follow-up start time generated for this planet
+        for i, obs_start_mjd_val in enumerate(prop_times_mjd):
+            # For this obs_start_mjd_val, find which integration times are observable
+            ko_mask[i, :] = self._get_observable_int_time_mask_for_start_time(
+                sInd=track.sInd,
+                mode_name=mode["syst"]["name"],
+                obs_start_mjd=obs_start_mjd_val,
+                sorted_int_times_days=_int_times,
+                overhead_days=overhead_days,
+                mission_finish_mjd=mission_finish_mjd,
+            )
+
+        # After the loop, ko_mask is now accurately populated for the specific prop_times_mjd
+        pdet[~ko_mask] = 0.0
+
+        # Mask observations that conflict with the existing schedule
+        mission_start_mjd = TK.missionStart.mjd
+        oh = (mode["syst"]["ohTime"] + self.Observatory.settlingTime).to_value(u.day)
+
+        # build candidate start / end grids  (n_t, n_int)
+        # absolute MJD
+        cand_starts = prop_times[:, None] + mission_start_mjd
+        cand_ends = cand_starts + _int_times[None, :] + oh
+
+        # Get scheduled blocks and check for conflicts
+        schedule_conflicts = False
+        sched_conflicts_mask = np.zeros_like(pdet, dtype=bool)
+        if self.schedule:
+            sched_starts = np.fromiter(
+                (a.start for a in self.schedule if a.start >= TK.currentTimeAbs.mjd),
+                dtype=float,
+            )
+            sched_ends = np.fromiter(
+                (a.end for a in self.schedule if a.start >= TK.currentTimeAbs.mjd),
+                dtype=float,
+            )
+
+            if sched_starts.size:
+                # broadcast and compare
+                overlaps = (
+                    (cand_starts[..., None] < sched_ends)
+                    & (cand_ends[..., None] > sched_starts)
+                ).any(axis=2)
+                sched_conflicts_mask = overlaps
+
+                if is_char and np.all(overlaps):
+                    schedule_conflicts = True
+
+                # collapse along the scheduled action axis
+                pdet[overlaps] = 0.0
+
+        # Mask out observations that would use too much integration time
+        available = self._available_obs_time()
+        fits_time = _int_times <= available
+        fits_time_mask = np.tile(fits_time, (pdet.shape[0], 1))
+
+        pdet[:, ~fits_time] = 0
+
+        # Mask out observations that would end after the mission ends
+        mission_life = TK.missionLife.to_value(u.d)
+        fits_mission = (prop_times[:, None] + _int_times[None, :] + oh) < mission_life
+
+        pdet[~fits_mission] = 0
+
+        # Check that any pdet is above threshold
+        if np.all(pdet == 0):
+            if is_char:
+                # Create debug plot for failed scheduling attempt
+                if hasattr(self, "debug_plots") and self.debug_plots:
+                    self._plot_scheduling_attempt(
+                        track,
+                        prop_times,
+                        _int_times,
+                        _pdet,
+                        threshold,
+                        mode,
+                        ko_status=ko_mask,
+                        schedule_conflicts=sched_conflicts_mask,
+                        time_limits=fits_time_mask,
+                        mission_limits=fits_mission,
+                        result="constraints_failure",
+                    )
+
+            # Second pass:  look for potentially good windows even if
+            # they collide with the current schedule, then see whether
+            # we can bump the conflicting blocks.
+            pdet_wo_sched = _pdet.copy()
+            # Threshold filter
+            pdet_wo_sched[pdet_wo_sched < threshold] = 0
+            # Keepout filter
+            pdet_wo_sched[~ko_mask] = 0
+            # still respect mission end and int-time limits
+            pdet_wo_sched[~fits_mission] = 0
+            pdet_wo_sched[:, ~fits_time] = 0
+
+            if np.all(pdet_wo_sched == 0):
+                # No valid windows found even without overlaps
+                return None, None, max_pdet, None
+
+            # Pick the highest pdet/intTime window
+            pdet_div_int = pdet_wo_sched / _int_times
+            row, col = jnp.unravel_index(jnp.argmax(pdet_div_int), pdet_div_int.shape)
+            cand_start = cand_starts[row, col]
+            cand_end = cand_ends[row, col]
+            pdet_val = pdet_wo_sched[row, col]
+
+            # Is everyone we collide with lower priority?
+            ok = self._bump_lower_priority_blocks(cand_start, cand_end, track)
+            if ok:
+                # put its planet/star back in the queue
+                if is_char:
+                    # Create debug plot for successful bump scheduling
+                    if hasattr(self, "debug_plots") and self.debug_plots:
+                        # Create an empty schedule conflict mask
+                        empty_sched_conflicts_mask = np.zeros_like(sched_conflicts_mask)
+
+                        self._plot_scheduling_attempt(
+                            track,
+                            prop_times,
+                            _int_times,
+                            _pdet,
+                            threshold,
+                            mode,
+                            ko_status=ko_mask,
+                            schedule_conflicts=empty_sched_conflicts_mask,
+                            time_limits=fits_time_mask,
+                            mission_limits=fits_mission,
+                            result="bump_success",
+                            selected_time=prop_times[row],
+                            selected_int=_int_times[col],
+                        )
+
+                return cand_start, _int_times[col], max_pdet, pdet_val
+
+            # still no luck
+            if is_char:
+                # Create debug plot for failed bump attempt
+                if hasattr(self, "debug_plots") and self.debug_plots:
+                    self._plot_scheduling_attempt(
+                        track,
+                        prop_times,
+                        _int_times,
+                        _pdet,
+                        threshold,
+                        mode,
+                        ko_status=ko_mask,
+                        schedule_conflicts=sched_conflicts_mask,
+                        time_limits=fits_time_mask,
+                        mission_limits=fits_mission,
+                        result="bump_failure",
+                        selected_time=prop_times[row],
+                        selected_int=_int_times[col],
+                    )
+
+            return None, None, max_pdet, None
+
+        pdet_div_int_time = pdet / _int_times
+
+        # Add a penalty for the time until the observation to prioritize
+        # fast follow-ups
+        time_penalty = (prop_times - current_time) / 100000000
+        pdet_div_int_time = pdet_div_int_time - time_penalty[:, None]
+
+        # Get the best time/int_time
+        row, col = jnp.unravel_index(
+            jnp.argmax(pdet_div_int_time), pdet_div_int_time.shape
+        )
+        t_start = prop_times[row] + TK.missionStart.mjd
+        int_time = _int_times[col]
+        pdet_val = pdet_div_int_time[row, col] * int_time
+        if is_char:
+            # Create debug plot for successful scheduling
+            if hasattr(self, "debug_plots") and self.debug_plots:
+                self._plot_scheduling_attempt(
+                    track,
+                    prop_times,
+                    _int_times,
+                    _pdet,
+                    threshold,
+                    mode,
+                    ko_status=ko_mask,
+                    schedule_conflicts=sched_conflicts_mask,
+                    time_limits=fits_time_mask,
+                    mission_limits=fits_mission,
+                    result="success",
+                    selected_time=prop_times[row],
+                    selected_int=int_time,
+                )
+
+        return t_start, int_time, max_pdet, pdet_val
+
+    def _bump_lower_priority_blocks(self, start: float, end: float, track: PlanetTrack):
+        """
+        Try to clear the time window [start, end).
+        Return True iff  **all** overlapping blocks had lower priority
+        and were successfully removed / rescheduled.
+        """
+        overlaps = list(self._itr.overlap(start, end))
+        if not overlaps:
+            return True  # nothing to bump
+
+        to_requeue: list[ScheduleAction] = []
+        for iv in overlaps:
+            purpose, tgt = iv.data
+            act = next(
+                a for a in self.schedule if a.start == iv.begin and a.end == iv.end
+            )
+
+            key = (act.target.sInd, act.target.pInd)
+            act_track = self.planet_tracks.get(key)
+            if act_track is None:
+                # Check whether the planet has been retired
+                act_track = self.retired_tracks.get(key)
+            if act_track.stage >= track.stage:
+                # This slot is already occupied by something at least as
+                # important, don't bump it
+                return False
+
+            to_requeue.append(act)
+
+        for act in to_requeue:
+            self.to_requeue.append(act)
+            self._remove_action(act)
+
+        return True
+
+    def _tracks_for_star(self, sInd: int):
+        """Iterator over all PlanetTracks belonging to one star."""
+        return (t for t in self.planet_tracks.values() if t.sInd == sInd)
+
+    def _star_ready_for_char(self, sInd: int) -> bool:
+        """True if any of the star's planet's is at the characterization threshold."""
+        return any(
+            t.ready_for_char(self.required_det_successes)
+            for t in self._tracks_for_star(sInd)
+        )
+
+    def _add_action(self, action):
+        """Helper to add an action to the schedule since I keep forgetting the syntax."""
+        _interval = Interval(
+            float(action.start), float(action.end), (action.purpose, action.target)
+        )
+
+        self._itr.add(_interval)
+        insort(self.schedule, action)
+
+    def _remove_action(self, action):
+        _interval = Interval(
+            float(action.start), float(action.end), (action.purpose, action.target)
+        )
+        self._itr.remove(_interval)
+        self.schedule.remove(action)
+
+    def _retire_track(self, track):
+        key = (track.sInd, track.pInd)
+        self.retired_tracks[key] = track
+        del self.planet_tracks[key]
+        self.ignore_stars.append(track.sInd)
+        for action in self.schedule:
+            # Check the schedule and remove any lingering actions
+            if action.target.sInd == track.sInd and action.target.pInd == track.pInd:
+                self._remove_action(action)
+
+    def next_action(self):
+        """Finds index of next target star and calculates its integration time.
+
+        This method chooses the next target star index based on which
+        stars are available, their integration time, and maximum completeness.
+        Returns None if no target could be found.
+
+        Args:
+            old_sInd (integer):
+                Index of the previous target star
+            mode (dict):
+                Selected observing mode for detection
+
+        Returns:
+            tuple:
+                DRM (dict):
+                    Design Reference Mission, contains the results of one complete
+                    observation (detection and characterization)
+                sInd (integer):
+                    Index of next target star. Defaults to None.
+                intTime (astropy Quantity):
+                    Selected star integration time for detection in units of day.
+                    Defaults to None.
+                waitTime (astropy Quantity):
+                    a strategically advantageous amount of time to wait in the case
+                    of an occulter for slew times
+
+        """
+        TL = self.TargetList
+
+        # If there is an observation in less than 12 hours, don't schedule any
+        # more observations
+        if len(self.schedule) > 0:
+            if self.schedule[0].start - self.TimeKeeping.currentTimeAbs.mjd < 0.5:
+                return None
+
+        # look for available targets
+        slewTimes = np.zeros(TL.nStars) << u.d
+
+        _epoch = self.init_epoch(self.base_det_mode, self.base_char_mode)
+        blind_sInds = self.get_available_targets(_epoch, self.base_det_mode)
+        blind_sInds = self.pre_inttime_filter(blind_sInds, _epoch, self.base_det_mode)
+
+        blind_intTimes = self.get_blind_inttimes(
+            blind_sInds, _epoch, self.base_det_mode
+        )
+
+        blind_mask = self.post_inttime_filter(
+            _epoch, blind_sInds, blind_intTimes, self.base_det_mode
+        )
+
+        # Apply the integration time masks
+        blind_sInds = blind_sInds[blind_mask]
+        blind_intTimes = blind_intTimes[blind_mask]
+
+        action = self.select_target(blind_sInds, blind_intTimes, slewTimes)
+        if action is not None:
+            self._add_action(action)
+
+    def init_epoch(self, det_mode, char_mode):
+        """Create epoch object for next_target."""
+        TK, Obs, TL = self.TimeKeeping, self.Observatory, self.TargetList
+        # Create an array of the current time in mission elapsed days
+        start_times_mjd = np.full(TL.nStars, TK.currentTimeAbs.mjd)
+        # Observatory and coronagraph overhead times
+        det_oh_time = det_mode["syst"]["ohTime"] + Obs.settlingTime
+        char_oh_time = char_mode["syst"]["ohTime"] + Obs.settlingTime
+
+        return Epoch(
+            now_norm=TK.currentTimeNorm.to_value(u.day),
+            start_times_mjd=start_times_mjd,
+            det_oh=det_oh_time.to_value(u.day),
+            char_oh=char_oh_time.to_value(u.day),
+        )
+
+    def get_available_targets(self, _epoch, det_mode):
+        """Get the blind detection target indices that are not in keepout."""
+        # intTimeFilterInds represents stars with integration times that are
+        # - positive
+        # - less than the intCutoff
+        _sInds = np.arange(self.TargetList.nStars)
+        sInds = np.intersect1d(self.intTimeFilterInds, _sInds).astype(int)
+        # Ignore stars that have been fully characterized
+        sInds = np.setdiff1d(sInds, self.ignore_stars)
+        # Create the initial lists based on keepout at the start of the observing window
+        # ko_inds = (
+        #     np.searchsorted(self.koTimes_mjd, _epoch.start_times_mjd, side="right") - 1
+        # )
+        # koMap = self.koMaps[det_mode["syst"]["name"]]
+
+        # # Get True/False for each target if it is not in keepout
+        # not_in_ko = koMap[sInds, ko_inds[sInds]].astype(bool)
+        observable_mask = np.ones(len(sInds), dtype=bool)  # Assume observable initially
+        for i, sInd in enumerate(sInds):
+            # Use the MJD time associated with this star from the _epoch object.
+            # Original code implied using _epoch.start_times_mjd (raw MJD before OH).
+            check_time_mjd = _epoch.start_times_mjd[sInd]
+
+            # Check the start time
+            if not self.is_observable(
+                sInd, det_mode["syst"]["name"], start_mjd=check_time_mjd
+            ):
+                observable_mask[i] = False
+        # Get the indices of blind detection targets that are not in keepout
+        # at the start of the observing window
+        sInds = sInds[observable_mask]
+
+        return sInds
+
+    def pre_inttime_filter(self, sInds, _epoch, det_mode):
+        """Detection filters that can be applied to the stars before knowing intTimes."""
+
+        # Don't do a detection on a star with a PlanetTrack object already
+        tracked_sInds = np.array([t.sInd for t in self.planet_tracks.values()])
+        sInds = np.setdiff1d(sInds, tracked_sInds)
+
+        # Remove stars with too many visits and no detections
+        det_mask = ~(
+            (self.det_starVisits[sInds] > self.n_det_remove)
+            & (self.sInd_detcounts[sInds] == 0)
+        )
+        sInds = sInds[det_mask]
+        return sInds
+
+    def get_blind_inttimes(self, sInds, _epoch, det_mode):
+        """Get the detection integration times for the given stars."""
+        Comp = self.Completeness
+        intTimes = Comp.best_intTime[sInds] << u.d
+        return intTimes
+
+    def _available_obs_time(self, ref=None):
+        TK = self.TimeKeeping
+        spent = TK.exoplanetObsTime.to_value(u.day)
+        held = sum(
+            bl.duration for bl in self.schedule if (ref is None) or (bl.start >= ref)
+        )
+        return TK.allocated_time_d - spent - held
+
+    def _available_obs_time(self, ref=None, mode=None):
+        """
+        Calculates the available exoplanet observation time, accounting for
+        spent time, currently scheduled (held) time, and future reserved time for active tracks.
+        Returns available time in days.
+        """
+        TK = self.TimeKeeping
+
+        # Time already spent on exoplanet science observations
+        spent_exoplanet_time_d = TK.exoplanetObsTime.to_value(u.d)
+        if mode is None:
+            mode = self.base_det_mode
+
+        obs_oh_time = (mode["syst"]["ohTime"] + self.Observatory.settlingTime).to_value(
+            u.d
+        )
+
+        # Time for observations already in self.schedule (future commitments)
+        # act.duration should already be in days and include overheads
+        scheduled_held_d = sum(
+            act.duration
+            for act in self.schedule
+            if (ref is None)
+            or (
+                act.start
+                >= (ref if isinstance(ref, (float, int)) else ref.to_value(u.d))
+            )
+        )
+
+        # Newly calculated reserved time for future needs of all active PlanetTracks
+        future_tracks_reserved_d = self._calculate_total_reserved_time_for_tracks()
+
+        # Total time allocated for exoplanet science in the mission
+        total_allocated_exoplanet_time_d = TK.allocated_time_d
+
+        # Net available time for new initiatives (e.g., blind searches)
+        net_available_d = (
+            total_allocated_exoplanet_time_d
+            - spent_exoplanet_time_d
+            - scheduled_held_d
+            - future_tracks_reserved_d
+            - obs_oh_time
+        )
+
+        return max(0.0, net_available_d)
+
+    def _get_estimated_max_int_time_for_mode(self, mode, sInd):
+        """
+        Helper to get a pessimistic (maximum) estimate of integration time for a given mode and star.
+        Returns time in days.
+        """
+        # Ensure dMag0s is initialized and contains the mode and sInd
+        dMag0Grid_for_star = self.dMag0s[mode["hex"]][sInd]
+        if dMag0Grid_for_star.int_times.size > 0:
+            return float(dMag0Grid_for_star.int_times[-1]) / 2
+
+    def _calculate_total_reserved_time_for_tracks(self):
+        """
+        Estimates the total future observation time (integration + overheads)
+        committed to all active PlanetTracks.
+        Returns total reserved time in days.
+        """
+        total_reserved_time_d = 0.0
+
+        # Get overhead estimates in days
+        det_oh_d = (
+            self.base_det_mode["syst"]["ohTime"] + self.Observatory.settlingTime
+        ).to_value(u.d)
+        char_oh_d = (
+            self.base_char_mode["syst"]["ohTime"] + self.Observatory.settlingTime
+        ).to_value(u.d)
+
+        for track in self.planet_tracks.values():
+            sInd = track.sInd
+
+            # Get pessimistic (maximum) integration time estimates for this track's star
+            est_max_int_time_det_d = self._get_estimated_max_int_time_for_mode(
+                self.base_det_mode, sInd
+            )
+            est_max_int_time_char_d = self._get_estimated_max_int_time_for_mode(
+                self.base_char_mode, sInd
+            )
+
+            remaining_detections_needed = 0
+            remaining_characterizations_needed = 0
+
+            # Calculate remaining characterizations first, as they depend on prior detections
+            if track.char_successes < self.required_char_successes:
+                # If not fully characterized
+                if track.det_successes >= self.required_det_successes:
+                    # All detections are done, only characterizations remain for this track
+                    remaining_characterizations_needed = (
+                        self.required_char_successes - track.char_successes
+                    )
+                else:
+                    # Still needs detections. Assume these detections will be successful
+                    # and then will require all characterization observations.
+                    remaining_detections_needed = (
+                        self.required_det_successes - track.det_successes
+                    )
+                    remaining_characterizations_needed = self.required_char_successes
+                    # (or self.required_char_successes - track.char_successes if some chars were done opportunistically)
+                    # For simplicity, assuming all chars are needed once dets are done:
+                    remaining_characterizations_needed = (
+                        self.required_char_successes - track.char_successes
+                    )
+
+            # Time for remaining detections for this track
+            reserved_for_track_dets = remaining_detections_needed * (
+                est_max_int_time_det_d + det_oh_d
+            )
+
+            # Time for remaining characterizations for this track
+            reserved_for_track_chars = remaining_characterizations_needed * (
+                est_max_int_time_char_d + char_oh_d
+            )
+
+            total_reserved_time_d += reserved_for_track_dets + reserved_for_track_chars
+
+        return total_reserved_time_d
+
+    def post_inttime_filter(self, _epoch, sInds, intTimes, mode):
+        """Create a mask for the detection targets after knowing intTimes."""
+        if len(sInds) == 0:
+            return np.zeros(0, dtype=bool)
+        # Remove targets with intTimes of 0
+        mask = intTimes != 0 * u.d
+
+        # Remove stars that are not observable for the entire observation window
+        mask &= self.ko_observability(sInds, _epoch, intTimes, mode)
+
+        # Remove stars that don't fit in the schedule
+        mask &= self.fits_schedule(
+            sInds, intTimes, _epoch.start_det[sInds], mode, "detection"
+        )
+
+        # Remove observations that would exceed the available observation time
+        # or use observation time saved for a scheduled observation
+        _necessary_time = (
+            intTimes.to_value(u.d)
+            + self.Observatory.settlingTime.to_value(u.d)
+            + mode["syst"]["ohTime"].to_value(u.d)
+        )
+        int_time_mask = _necessary_time <= self._available_obs_time()
+        mask &= int_time_mask
+
+        return mask
+
+    def ko_observability(self, sInds, _epoch, intTimes, mode):
+        """
+        Return a boolean array the same length as sInds:
+        True means the star is outside keepout for the full observation window.
+        """
+        koMap = self.koMaps[mode["syst"]["name"]]
+        start_mjd = _epoch.start_det[sInds]
+        end_mjd = start_mjd + intTimes.to_value(u.d)
+        # idx0 = index of time whose interval starts just before `start`
+        idx0 = np.searchsorted(self.koTimes_mjd, start_mjd, side="right") - 1
+        # idx1 = index of time whose interval starts just before `end`
+        idx1 = np.searchsorted(self.koTimes_mjd, end_mjd, side="right") - 1
+
+        # clip to avoid out of bounds
+        idx0 = np.clip(idx0, 0, len(self.koTimes_mjd) - 1)
+        idx1 = np.clip(idx1, 0, len(self.koTimes_mjd) - 1)
+
+        observable = np.zeros(len(sInds), dtype=bool)
+        for k, sInd in enumerate(sInds):
+            # Determine if the star is observable for the entire observation window
+            observable[k] = (koMap[sInd, idx0[k] : idx1[k] + 1]).all()
+
+        return observable
+
+    def is_observable(self, sInd, mode_name, start_mjd, end_mjd=None):
+        """
+        Checks if a target star is observable (i.e., not in keepout) for a given mode
+        and time (or time interval).
+
+        Args:
+            sInd (int): The star index.
+            mode_name (str): The name of the observing mode (key for self.ko_intervals).
+                             Typically from mode['syst']['name'].
+            start_mjd (float): The start MJD of the check.
+            end_mjd (Optional[float]): The end MJD of the check. The interval is
+                                       treated as [start_mjd, end_mjd).
+                                       If None, a point-in-time check is performed at start_mjd.
+        Returns:
+            bool: True if the star is observable during the specified time/interval,
+                  False if it is in keepout or if the mode is not found.
+        """
+        if mode_name not in self.ko_intervals:
+            self.logger.error(
+                f"Observing mode '{mode_name}' not found in ko_intervals for sInd {sInd}. Assuming not observable."
+            )
+            return False
+
+        # Check if sInd is valid for the list of trees for that mode
+        if sInd < 0 or sInd >= len(self.ko_intervals[mode_name]):
+            self.logger.error(
+                f"Invalid sInd {sInd} for mode '{mode_name}' in ko_intervals. Assuming not observable."
+            )
+            return False
+
+        star_ko_tree = self.ko_intervals[mode_name][sInd]
+
+        if end_mjd is None:
+            # Point-in-time check: Is the star in keepout AT start_mjd?
+            # .at(point) returns a set of intervals containing the point.
+            # If the set is non-empty, it's in keepout.
+            return not bool(star_ko_tree.at(start_mjd))
+        else:
+            # Duration check: Is the star in keepout ANYWHERE IN [start_mjd, end_mjd)?
+            if start_mjd >= end_mjd:
+                self.logger.warning(
+                    f"Invalid duration for observability check: start_mjd ({start_mjd}) >= end_mjd ({end_mjd}) for sInd {sInd}, mode {mode_name}. Assuming not observable."
+                )
+                return False
+            # .overlaps(begin, end) returns True if any interval in the tree overlaps [begin, end).
+            # So, if it overlaps, it's in keepout (not observable).
+            return not star_ko_tree.overlaps(start_mjd, end_mjd)
+
+    def _get_observable_int_time_mask_for_start_time(
+        self,
+        sInd: int,
+        mode_name: str,
+        obs_start_mjd: float,
+        sorted_int_times_days: np.ndarray,
+        overhead_days: float,
+    ) -> np.ndarray:
+        """
+        For a given star and observation start time, determines which integration
+        times result in an observable window using a bisection search approach.
+
+        Assumes sorted_int_times_days is sorted in ascending order.
+
+        Args:
+            sInd (int): Star index.
+            mode_name (str): Observing mode name.
+            obs_start_mjd (float): The MJD for the start of the observation.
+            sorted_int_times_days (np.ndarray): 1D array of integration times (in days), sorted ascending.
+            overhead_days (float): Total overhead time (settling + instrument) in days.
+
+        Returns:
+            np.ndarray: A 1D boolean mask of the same length as sorted_int_times_days.
+                        True if the observation [obs_start_mjd, obs_start_mjd + int_time + overhead)
+                        is observable, False otherwise.
+        """
+        num_int_times = len(sorted_int_times_days)
+        if num_int_times == 0:
+            return np.array([], dtype=bool)
+
+        # This mask will be [True, True, ..., True, False, False, ...]
+        observable_mask = np.zeros(num_int_times, dtype=bool)
+
+        # Bisection search to find the first integration time index (k)
+        # such that the interval [obs_start_mjd, obs_start_mjd + sorted_int_times_days[k] + overhead_days)
+        # is NOT observable. All intervals with indices < k will be observable.
+        low = 0
+        high = num_int_times  # Exclusive upper bound for search, represents count of observable int_times
+        first_non_observable_idx = num_int_times  # Assume all are observable initially
+
+        while low < high:
+            mid_idx = low + (high - low) // 2
+            current_int_time = sorted_int_times_days[mid_idx]
+            obs_end_mjd = obs_start_mjd + current_int_time + overhead_days
+
+            if self.is_observable(sInd, mode_name, obs_start_mjd, obs_end_mjd):
+                # This interval is observable. The first non-observable one must be further to the right
+                # (i.e., a longer integration time, or all are observable so far).
+                low = mid_idx + 1
+            else:
+                # This interval is NOT observable. This could be the first non-observable one.
+                # Record it and search in the left half (including this mid_idx).
+                first_non_observable_idx = mid_idx
+                high = mid_idx
+
+        # All integration times from index 0 up to first_non_observable_idx - 1 are observable.
+        if first_non_observable_idx > 0:
+            observable_mask[0:first_non_observable_idx] = True
+
+        return observable_mask
+
+    def _get_observable_int_time_mask_for_start_time(
+        self,
+        sInd: int,
+        mode_name: str,
+        obs_start_mjd: float,
+        sorted_int_times_days: np.ndarray,
+        overhead_days: float,
+        mission_finish_mjd: float,
+    ) -> np.ndarray:
+        num_int_times = len(sorted_int_times_days)
+        if num_int_times == 0:
+            return np.array([], dtype=bool)
+
+        observable_mask = np.zeros(num_int_times, dtype=bool)
+        star_ko_tree = self.ko_intervals[mode_name][sInd]
+
+        # Check if obs_start_mjd itself is in a keepout interval
+        if star_ko_tree.at(obs_start_mjd):
+            # All False, cannot start an observation
+            return observable_mask
+
+        # Find the start of the next keepout interval strictly after obs_start_mjd
+        # Query intervals that start after obs_start_mjd or overlap with a point slightly after obs_start_mjd
+        # This ensures we find the *next* relevant keepout.
+        potential_limiters = [
+            iv.begin for iv in star_ko_tree if iv.begin > obs_start_mjd
+        ]
+
+        # Default if no future keepouts
+        min_future_ko_begin_mjd = mission_finish_mjd
+        if not potential_limiters:
+            # No keepout starts after obs_start_mjd
+            pass
+        else:
+            min_future_ko_begin_mjd = min(potential_limiters)
+
+        # Max observation end time is the start of the next keepout
+        max_obs_end_mjd = min_future_ko_begin_mjd
+
+        # Max allowed total duration (int_time + overhead)
+        max_total_duration_days = max_obs_end_mjd - obs_start_mjd
+        if max_total_duration_days <= 0:
+            # Should not happen if .at() was false and logic is right
+            return observable_mask
+
+        max_allowed_int_time_days = max_total_duration_days - overhead_days
+
+        if max_allowed_int_time_days <= 0:
+            return observable_mask
+
+        # count of elements <= max_allowed_int_time_days
+        count_observable = np.searchsorted(
+            sorted_int_times_days, max_allowed_int_time_days, side="right"
+        )
+
+        observable_mask[:count_observable] = True
+
+        return observable_mask
+
+    def fits_schedule(self, sInds, intTimes, start_mjds, mode, purpose):
+        """Returns a boolean array the same length as sInds:
+        True means the observation does not conflict with scheduled observations.
+        """
+        oh = (mode["syst"]["ohTime"] + self.Observatory.settlingTime).to_value(u.day)
+        # build ObservationRequests in a loop because intTimes is Quantity
+        fits = np.ones(len(sInds), dtype=bool)
+        _int_times = intTimes.to_value(u.d)
+        for k, (ind, int_time, start) in enumerate(zip(sInds, _int_times, start_mjds)):
+            conflict = self._itr.overlaps(start, start + int_time + oh)
+            fits[k] = not conflict
+        return fits
+
+    def select_target(self, blind_sInds, blind_intTimes, slewTimes):
+        """
+        Select the next target to observe.
+
+        Returns an Observation object with all available info filled in.
+        """
+        target = None
+        if len(blind_sInds) > 0:
+            # Choose a blind detection target
+            purpose = "detection"
+            target, int_time, wait_time, comp, comp_d_t = self.choose_blind_target(
+                blind_sInds, blind_intTimes, slewTimes
+            )
+            oh = (
+                self.Observatory.settlingTime + self.base_det_mode["syst"]["ohTime"]
+            ).to_value(u.day)
+        if target is None:
+            # No targets available, return None
+            return None
+        if comp_d_t < self.min_comp_div_int_time:
+            # Observations are not providing significant information, so we should
+            # wait until the next possible observation
+
+            # If there is an obseravtion within the minimum possible integration time
+            # return None, otherwise do a short wait
+            _oh = self.Observatory.settlingTime.to_value(u.day) + self.base_det_mode[
+                "syst"
+            ]["ohTime"].to_value(u.day)
+            min_duration = 2 * (self.min_int_time_d + oh)
+            current_time = self.TimeKeeping.currentTimeAbs.mjd
+            if self.schedule:
+                next_action = self.schedule[0]
+                if next_action.start - current_time < min_duration:
+                    return None
+            # do a short wait
+            action = ScheduleAction(
+                start=current_time,
+                duration=min_duration,
+                purpose="general_astrophysics",
+                target=None,
+                mode=None,
+            )
+        else:
+            # Gather all available info for the observation
+            arrival_time = self.TimeKeeping.currentTimeAbs.mjd
+
+            # Increment the observation number since we're scheduling an observation
+            self.ObsNum += 1
+            _int_time = int_time.to_value(u.day)
+            action = ScheduleAction(
+                start=arrival_time,
+                duration=_int_time + oh,
+                purpose=purpose,
+                target=target,
+                mode=self.base_det_mode,
+                int_time=_int_time,
+                blind=True,
+                comp=comp,
+            )
+            action.mode = self.base_det_mode
+        return action
+
+    def choose_blind_target(self, sInds, intTimes, slewTimes):
+        """Choose a target from the list of blind targets.
+
+        Returns None if there are no available blind targets.
+
+        Args:
+            sInds (integer array):
+                Indices of available blind targets
+            intTimes (astropy Quantity array):
+                Integration times for the available blind targets
+            slewTimes (astropy Quantity array):
+                Slew times for the available blind targets
+        """
+        # Choose the star with the highest complten
+        Comp = self.Completeness
+        # For stars with ensembles we need to get the completeness at the current time
+        ens_inds = []
+        ens_best_comp_div_intTime = []
+        ens_best_intTime = []
+        _revisit_best_comp_div_intTime = 0
+        if len(self.star_ensembles) > 0:
+            TK = self.TimeKeeping
+            _revisit_inds = []
+            for sInd, ens in self.star_ensembles.items():
+                if sInd not in sInds:
+                    continue
+                if TK.currentTimeNorm.to_value(u.day) < ens.next_available_time:
+                    # Star isn't near it's maximum dynamic completeness so we can
+                    # ignore it
+                    continue
+                ens_inds.append(sInd)
+                t_ind = (
+                    np.searchsorted(
+                        ens.times, TK.currentTimeNorm.to_value(u.day), side="right"
+                    )
+                    - 1
+                )
+                # Get the maximum dynamic completeness per unit of integration time
+                # for the star
+                ens_best_comp_div_intTime.append(ens.best_comp_div_intTime[t_ind])
+                ens_best_intTime.append(ens.best_int_times[t_ind])
+            if len(ens_best_comp_div_intTime) > 0:
+                # Choose the best star for revisit
+                _revisit_ind = np.argmax(ens_best_comp_div_intTime)
+                _revisit_best_comp_div_intTime = ens_best_comp_div_intTime[_revisit_ind]
+                _revisit_best_intTime = ens_best_intTime[_revisit_ind]
+                _revisit_sInd = ens_inds[_revisit_ind]
+
+        # For stars with no observations yet, choose the one with the highest
+        # completeness/intTime
+        _blind_sInds = np.setdiff1d(sInds, ens_inds)
+        best_blind_comp_div_intTime = 0
+        if len(_blind_sInds) > 0:
+            _blind_comp_div_intTime = Comp.best_comp_div_intTime[_blind_sInds]
+            # _ind is the index of the star with the highest completeness/intTime
+            # (OF THE PROVIDED STARS)
+            _blind_ind = np.argmax(_blind_comp_div_intTime)
+            _blind_sInd = _blind_sInds[_blind_ind]
+            best_blind_comp_div_intTime = _blind_comp_div_intTime[_blind_ind]
+
+        # Compare the best revisit target to the best blind target
+        if _revisit_best_comp_div_intTime > best_blind_comp_div_intTime:
+            sInd = _revisit_sInd
+            _ind = np.where(sInds == sInd)[0][0]
+            int_time = _revisit_best_intTime * u.d
+            comp = (
+                self.PlanetPopulation._eta
+                * _revisit_best_comp_div_intTime
+                * _revisit_best_intTime
+            )
+            comp_d_t = _revisit_best_comp_div_intTime
+        else:
+            sInd = _blind_sInd
+            _ind = np.where(sInds == sInd)[0][0]
+            int_time = intTimes[_ind]
+            comp = (
+                self.PlanetPopulation._eta
+                * best_blind_comp_div_intTime
+                * int_time.to_value(u.day)
+            )
+            comp_d_t = best_blind_comp_div_intTime
+        # Get the slew time
+        slew_time = slewTimes[_ind]
+
+        target = Target.star(sInd)
+        return target, int_time, slew_time, comp, comp_d_t
+
+    def observation_detection(self, sInd, intTime, mode):
+        """Determines SNR and detection status for a given integration time
+        for detection. Also updates the lastDetected and starRevisit lists.
+
+        Args:
+            sInd (int):
+                Integer index of the star of interest
+            intTime (~astropy.units.Quantity(~numpy.ndarray(float))):
+                Selected star integration time for detection in units of day.
+                Defaults to None.
+            mode (dict):
+                Selected observing mode for detection
+
+        Returns:
+            tuple:
+                detected (numpy.ndarray(int)):
+                    Detection status for each planet orbiting the observed target star:
+                    1 is detection, 0 missed detection, -1 below IWA, and -2 beyond OWA
+                fZ (astropy.units.Quantity(numpy.ndarray(float))):
+                    Surface brightness of local zodiacal light in units of 1/arcsec2
+                JEZ (astropy.units.Quantity(numpy.ndarray(float))):
+                    Intensity of exo-zodiacal light in units of photons/s/m2/arcsec2
+                systemParams (dict):
+                    Dictionary of time-dependant planet properties averaged over the
+                    duration of the integration
+                SNR (numpy.darray(float)):
+                    Detection signal-to-noise ratio of the observable planets
+                FA (bool):
+                    False alarm (false positive) boolean
+
+        """
+
+        PPop = self.PlanetPopulation
+        ZL = self.ZodiacalLight
+        PPro = self.PostProcessing
+        TL = self.TargetList
+        SU = self.SimulatedUniverse
+        Obs = self.Observatory
+        TK = self.TimeKeeping
+
+        # Save Current Time before attempting time allocation
+        currentTimeNorm = TK.currentTimeNorm.copy()
+        currentTimeAbs = TK.currentTimeAbs.copy()
+
+        # Allocate Time
+        extraTime = intTime * (mode["timeMultiplier"] - 1.0)  # calculates extraTime
+        success = TK.allocate_time(
+            intTime + extraTime + Obs.settlingTime + mode["syst"]["ohTime"], True
+        )
+        if not success:
+            breakpoint()
+        assert success, "Could not allocate observation detection time ({}).".format(
+            intTime + extraTime + Obs.settlingTime + mode["syst"]["ohTime"]
+        )
+        # calculates partial time to be added for every ntFlux
+        dt = intTime / float(self.ntFlux)
+        # find indices of planets around the target
+        pInds = np.where(SU.plan2star == sInd)[0]
+
+        # initialize outputs
+        detected = np.array([], dtype=int)
+        # write current system params by default
+        systemParams = SU.dump_system_params(sInd)
+        SNR = np.zeros(len(pInds))
+
+        # if any planet, calculate SNR
+        if len(pInds) > 0:
+            # initialize arrays for SNR integration
+            fZs = np.zeros(self.ntFlux) << self.fZ_unit
+            systemParamss = np.empty(self.ntFlux, dtype="object")
+            JEZs = np.zeros((self.ntFlux, len(pInds))) << self.JEZ_unit
+            Ss = np.zeros((self.ntFlux, len(pInds)))
+            Ns = np.zeros((self.ntFlux, len(pInds)))
+            # accounts for the time since the current time
+            timePlus = Obs.settlingTime.copy() + mode["syst"]["ohTime"].copy()
+            # integrate the signal (planet flux) and noise
+            for i in range(self.ntFlux):
+                # allocate first half of dt
+                timePlus += dt / 2.0
+                # calculate current zodiacal light brightness
+                fZs[i] = ZL.fZ(
+                    Obs,
+                    TL,
+                    np.array([sInd], ndmin=1),
+                    (currentTimeAbs).reshape(1),
+                    mode,
+                )[0]
+                # propagate the system to match up with current time
+                # SU.propag_system(
+                #     sInd, currentTimeNorm + timePlus - self.propagTimes[sInd]
+                # )
+                SU.propag_system(sInd, currentTimeNorm - self.propagTimes[sInd])
+                # Calculate the exozodi intensity
+                JEZs[i] = SU.scale_JEZ(sInd, mode)
+                self.propagTimes[sInd] = currentTimeNorm  # + timePlus
+                # save planet parameters
+                systemParamss[i] = SU.dump_system_params(sInd)
+                # calculate signal and noise (electron count rates)
+                Ss[i, :], Ns[i, :] = self.calc_signal_noise(
+                    sInd, pInds, dt, mode, fZ=fZs[i], JEZ=JEZs[i]
+                )
+                # allocate second half of dt
+                timePlus += dt / 2.0
+
+            # average output parameters
+            fZ = np.mean(fZs)
+            JEZ = np.mean(JEZs, axis=0)
+            systemParams = {
+                key: sum([systemParamss[x][key] for x in range(self.ntFlux)])
+                / float(self.ntFlux)
+                for key in sorted(systemParamss[0])
+            }
+            # calculate SNR
+            S = Ss.sum(0)
+            N = Ns.sum(0)
+            SNR[N > 0] = S[N > 0] / N[N > 0]
+
+        # if no planet, just save zodiacal brightness in the middle of the integration
+        else:
+            fZ = ZL.fZ(
+                Obs,
+                TL,
+                np.array([sInd], ndmin=1),
+                (currentTimeAbs).reshape(1),
+                mode,
+            )[0]
+            # Use the default star value if no planets
+            JEZ = TL.JEZ0[mode["hex"]][sInd]
+
+        # find out if a false positive (false alarm) or any false negative
+        # (missed detections) have occurred
+        FA, MD = PPro.det_occur(SNR, mode, TL, sInd, intTime)
+
+        # populate detection status array
+        # 1:detected, 0:missed, -1:below IWA, -2:beyond OWA
+        if len(pInds) > 0:
+            detected = (~MD).astype(int)
+            WA = (
+                np.array(
+                    [
+                        systemParamss[x]["WA"].to_value(u.arcsec)
+                        for x in range(len(systemParamss))
+                    ]
+                )
+                << u.arcsec
+            )
+            detected[np.all(WA < mode["IWA"], 0)] = -1
+            detected[np.all(WA > mode["OWA"], 0)] = -2
+
+        # if planets are detected, calculate the minimum apparent separation
+        det = detected == 1  # If any of the planets around the star have been detected
+
+        # populate the lastDetected array by storing det, JEZ, dMag, and WA
+        self.lastDetected[sInd, :] = [
+            det,
+            JEZ.flatten(),
+            systemParams["dMag"],
+            systemParams["WA"].to("arcsec").value,
+        ]
+
+        # Create debug plots if enabled and we have detected planets
+        if hasattr(self, "debug_plots") and self.debug_plots and np.any(detected > 0):
+            pInds_detected = pInds[detected > 0]
+            snr_detected = SNR[detected > 0]
+            # if len(pInds_detected) > 0:
+            #     self.plot_observation_results(
+            #         sInd,
+            #         pInds_detected,
+            #         mode,
+            #         intTime,
+            #         snr_detected,
+            #         purpose="detection",
+            #         save_dir="plots/detection",
+            #     )
+
+        return detected.astype(int), fZ, JEZ, systemParams, SNR, FA
+
+    def observation_characterization(self, sInd, mode, mode_index, char_intTime=None):
+        """Finds if characterizations are possible and relevant information
+
+        Args:
+            sInd (integer):
+                Integer index of the star of interest
+            mode (dict):
+                Selected observing mode for characterization
+
+        Returns:
+            characterized (integer list):
+                Characterization status for each planet orbiting the observed
+                target star including False Alarm if any, where 1 is full spectrum,
+                -1 partial spectrum, and 0 not characterized
+            fZ (astropy Quantity):
+                Surface brightness of local zodiacal light in units of 1/arcsec2
+            JEZ (astropy Quantity):
+                Intensity of exo-zodiacal light in units of ph/s/m2/arcsec2
+            systemParams (dict):
+                Dictionary of time-dependant planet properties averaged over the
+                duration of the integration
+            SNR (float ndarray):
+                Characterization signal-to-noise ratio of the observable planets.
+                Defaults to None.
+            intTime (astropy Quantity):
+                Selected star characterization time in units of day. Defaults to None.
+
+        """
+
+        OS = self.OpticalSystem
+        ZL = self.ZodiacalLight
+        TL = self.TargetList
+        SU = self.SimulatedUniverse
+        Obs = self.Observatory
+        TK = self.TimeKeeping
+
+        # find indices of planets around the target
+        pInds = np.where(SU.plan2star == sInd)[0]
+        JEZs = SU.scale_JEZ(sInd, mode)
+        dMags = SU.dMag[pInds]
+        WAs = SU.WA[pInds].to_value(u.arcsec)
+
+        # get the detected status, and check if there was a FA
+        # det = self.lastDetected[sInd,0]
+        pIndsDet = np.ones(pInds.size, dtype=bool)
+
+        # initialize outputs, and check if there's anything (planet or FA)
+        # to characterize
+        characterized = np.zeros(len(pIndsDet), dtype=int)
+        fZ = 0.0 << self.inv_arcsec2
+        JEZ = 0.0 << self.JEZ_unit
+        # write current system params by default
+        systemParams = SU.dump_system_params(sInd)
+        SNR = np.zeros(len(pIndsDet))
+        intTime = char_intTime
+        if len(pIndsDet) == 0:  # nothing to characterize
+            return characterized, fZ, JEZ, systemParams, SNR, intTime
+
+        # start times
+        startTime = TK.currentTimeAbs.copy() + mode["syst"]["ohTime"] + Obs.settlingTime
+        startTimeNorm = (
+            TK.currentTimeNorm.copy() + mode["syst"]["ohTime"] + Obs.settlingTime
+        )
+        # planets to characterize
+        koTimeInd = np.where(np.round(startTime.value) - self.koTimes.value == 0)[0][0]
+        # wherever koMap is 1, the target is observable
+        koMap = self.koMaps[mode["syst"]["name"]]
+        ko_good = koMap[sInd][koTimeInd]
+
+        # Check that the observation time is valid
+
+        # fZ = ZL.fZ(Obs, TL, np.array([sInd], ndmin=1), startTime.reshape(1), mode)
+        # WAp = TL.int_WA[sInd] * np.ones(len(pInds))
+        # dMag = TL.int_dMag[sInd] * np.ones(len(pInds))
+
+        # Determine the single total time for the observation
+        # intTime is already set to the max required time from next_target
+        totTime = intTime
+        # end times
+        endTime = startTime + totTime
+        endTimeNorm = startTimeNorm + totTime
+
+        # Check if the calculated observation time is valid
+        time_is_valid = (
+            (totTime > 0)
+            & (totTime <= OS.intCutoff)
+            & (endTimeNorm <= TK.OBendTimes[TK.OBnumber])
+        )
+
+        # If the time is invalid, no planets can be characterized
+
+        # Otherwise, tochar retains its current state (filtered by start keepout)
+        # and will be further filtered by end keepout below.
+
+        # 3/ is target still observable at the end of any char time?
+        # Check keepout at the single endTime
+        endTime_val = endTime.value
+
+        # Find index for the rounded end time
+        if endTime_val > self.koTimes.value[-1]:
+            koTimeInd = -1  # End time is out of bounds
+        else:
+            # Find index of the last index that is less than or equal to endTime_val
+            koTimeInd = np.searchsorted(self.koTimes_mjd, endTime_val, side="right") - 1
+
+        # Get keepout status. If koTimeInd is invalid or target is not observable,
+        # set end_time_observable to False.
+        end_time_observable = False
+        if koTimeInd != -1:
+            koMap = self.koMaps[mode["syst"]["name"]]
+            if koMap[sInd][koTimeInd]:
+                end_time_observable = True
+
+        # 4/ if yes, perform the characterization for the maximum char time
+        if ko_good and end_time_observable and time_is_valid:
+            # Save Current Time before attempting time allocation
+            currentTimeNorm = TK.currentTimeNorm.copy()
+            currentTimeAbs = TK.currentTimeAbs.copy()
+
+            # intTime was calculated in next_target to be the maximum required
+            # time for the planets considered characterizable then.
+            # We use that value directly.
+
+            extraTime = 0
+            success = TK.allocate_time(
+                intTime + extraTime + mode["syst"]["ohTime"] + Obs.settlingTime, True
+            )
+            # allocates time
+            if not (success):
+                char_intTime = None
+                lenChar = len(pInds)
+                characterized = np.zeros(lenChar, dtype=int)
+                char_SNR = np.zeros(lenChar, dtype=float)
+                char_fZ = 0.0 << self.inv_arcsec2
+                char_JEZ = 0.0 << self.JEZ_unit
+                char_systemParams = SU.dump_system_params(sInd)
+                return (
+                    characterized,
+                    char_fZ,
+                    char_JEZ,
+                    char_systemParams,
+                    char_SNR,
+                    char_intTime,
+                )
+
+            # pIndsChar = pIndsDet[tochar]
+            # log_char = "   - Charact. planet(s) %s (%s/%s detected)" % (
+            #     pIndsChar,
+            #     len(pIndsChar),
+            #     len(pIndsDet),
+            # )
+            # self.logger.info(log_char)
+            # self.vprint(log_char)
+
+            # SNR CALCULATION:
+            # first, calculate SNR for observable planets (without false alarm)
+            planinds = pIndsDet
+            SNRplans = np.zeros(len(planinds))
+            if len(planinds) > 0:
+                # initialize arrays for SNR integration
+                fZs = np.zeros(self.ntFlux) << self.inv_arcsec2
+                JEZs = np.zeros((self.ntFlux, len(planinds))) << self.JEZ_unit
+                systemParamss = np.empty(self.ntFlux, dtype="object")
+                Ss = np.zeros((self.ntFlux, len(planinds)))
+                Ns = np.zeros((self.ntFlux, len(planinds)))
+                # integrate the signal (planet flux) and noise
+                dt = intTime / float(self.ntFlux)
+                timePlus = (
+                    Obs.settlingTime.copy() + mode["syst"]["ohTime"].copy()
+                )  # accounts for the time since the current time
+                for i in range(self.ntFlux):
+                    # calculate signal and noise (electron count rates)
+                    # allocate first half of dt
+                    timePlus += dt / 2.0
+                    # calculate current zodiacal light brightness
+                    fZs[i] = ZL.fZ(
+                        Obs,
+                        TL,
+                        np.array([sInd], ndmin=1),
+                        (currentTimeAbs).reshape(1),
+                        mode,
+                    )[0]
+                    # propagate the system to match up with current time
+                    # SU.propag_system(
+                    #     sInd, currentTimeNorm + timePlus - self.propagTimes[sInd]
+                    # )
+                    SU.propag_system(sInd, currentTimeNorm - self.propagTimes[sInd])
+                    self.propagTimes[sInd] = currentTimeNorm  # + timePlus
+                    # Calculate the exozodi intensity
+                    JEZs[i] = SU.scale_JEZ(sInd, mode, pInds=pInds)
+                    # save planet parameters
+                    systemParamss[i] = SU.dump_system_params(sInd)
+                    # calculate signal and noise (electron count rates)
+                    Ss[i, :], Ns[i, :] = self.calc_signal_noise(
+                        sInd, pInds, dt, mode, fZ=fZs[i], JEZ=JEZs[i]
+                    )
+                    # allocate second half of dt
+                    timePlus += dt / 2.0
+
+                # average output parameters
+                fZ = np.mean(fZs)
+                JEZ = np.mean(JEZs, axis=0)
+                systemParams = {
+                    key: sum([systemParamss[x][key] for x in range(self.ntFlux)])
+                    / float(self.ntFlux)
+                    for key in sorted(systemParamss[0])
+                }
+                # calculate planets SNR
+                S = Ss.sum(0)
+                N = Ns.sum(0)
+                SNRplans[N > 0] = S[N > 0] / N[N > 0]
+                # allocate extra time for timeMultiplier
+            # if only a FA, just save zodiacal brightness in the middle of the
+            # integration
+            else:
+                # totTime = intTime * (mode["timeMultiplier"])
+                fZ = ZL.fZ(
+                    Obs,
+                    TL,
+                    np.array([sInd], ndmin=1),
+                    TK.currentTimeAbs.copy().reshape(1),
+                    mode,
+                )[0]
+                # Use the default star value if no planets
+                JEZ = TL.JEZ0[mode["hex"]][sInd]
+
+            # calculate the false alarm SNR (if any)
+            SNRfa = []
+
+            # save all SNRs (planets and FA) to one array
+            SNRinds = np.where(pIndsDet)[0]
+            SNR[SNRinds] = np.append(SNRplans, SNRfa)
+
+            # now, store characterization status: 1 for full spectrum,
+            # -1 for partial spectrum, 0 for not characterized
+            char = SNR >= mode["SNR"]
+            # initialize with full spectra
+            characterized = char.astype(int)
+            WAchar = WAs[char] * u.arcsec
+            # find the current WAs of characterized planets
+            WAs = systemParams["WA"]
+            # check for partial spectra
+            IWA_max = mode["IWA"] * (1.0 + mode["BW"] / 2.0)
+            OWA_min = mode["OWA"] * (1.0 - mode["BW"] / 2.0)
+            char[char] = (WAchar < IWA_max) | (WAchar > OWA_min)
+            characterized[char] = -1
+
+            # encode results in spectra lists (only for planets, not FA)
+            charplans = characterized
+            self.fullSpectra[mode_index][pInds[charplans == 1]] += 1
+            self.partialSpectra[mode_index][pInds[charplans == -1]] += 1
+
+            # Create debug plots if enabled and we have characterized planets
+            if (
+                hasattr(self, "debug_plots") and self.debug_plots
+                # and np.any(characterized != 0)
+            ):
+                # pInds_char = pInds[characterized != 0]
+                # snr_char = SNR[characterized != 0]
+                pInds_char = pInds
+                snr_char = SNR
+                if len(pInds_char) > 0:
+                    self.plot_observation_results(
+                        sInd,
+                        pInds_char,
+                        mode,
+                        intTime,
+                        snr_char,
+                        purpose="characterization",
+                        save_dir="plots/characterization",
+                    )
+
+        return characterized.astype(int), fZ, JEZ, systemParams, SNR, intTime
+
+    def char_revisit_filter(self, char_sInds, _epoch):
+        """Filter out stars that aren't ready for revisit yet."""
+        char_tovisit = np.zeros(self.TargetList.nStars, dtype=bool)
+
+        # Only consider stars that haven't exceeded visit limit
+        char_tovisit[char_sInds] = self.char_starVisits[char_sInds] < self.nVisitsMax
+
+        # Filter out stars that aren't ready for revisit yet
+        if self.char_starRevisit.size != 0:
+            # char_starRevisit's second column is the time when the star
+            # should be revisited and we don't want them in the
+            # char_tovisit list if currentTimeNorm < revisit time
+            is_too_early = _epoch.now_norm < self.char_starRevisit[:, 1]
+            # Get stars with where the revisit time hasn't been reached
+            too_early_stars = self.char_starRevisit[is_too_early, 0].astype(int)
+            # Remove these from consideration
+            char_tovisit[too_early_stars] = False
+
+        return np.where(char_tovisit)[0]
+
+    def select_default_observing_modes(self):
+        """
+        Identify default detection and characterization observing modes.
+        """
+        OS = self.OpticalSystem
+        allModes = OS.observingModes
+        det_modes = list(filter(lambda mode: "imag" in mode["inst"]["name"], allModes))
+        base_det_mode = list(filter(lambda mode: mode["detectionMode"], allModes))[0]
+        # and for characterization (default is first spectro/IFS mode)
+        spectroModes = list(
+            filter(lambda mode: "spec" in mode["inst"]["name"], allModes)
+        )
+        if np.any(spectroModes):
+            char_modes = spectroModes
+        # if no spectro mode, default char mode is first observing mode
+        else:
+            char_modes = [allModes[0]]
+
+        self.det_modes = det_modes
+        self.base_det_mode = base_det_mode
+        self.char_modes = char_modes
+        self.base_char_mode = char_modes[0]
+
+    def do_detection(self, action):
+        """Tasks related to a detection observation"""
+        SU, TL, TK, Comp = (
+            self.SimulatedUniverse,
+            self.TargetList,
+            self.TimeKeeping,
+            self.Completeness,
+        )
+        _meta = self._build_meta(action)
+        _drm_entry = {}
+
+        # update visited list for selected star
+        self.starVisits[action.target.sInd] += 1
+        self.det_starVisits[action.target.sInd] += 1
+        # PERFORM DETECTION
+        _int_time = action.int_time.copy() << u.d
+        detected, det_fZ, det_JEZ, det_systemParams, det_SNR, FA = (
+            self.observation_detection(action.target.sInd, _int_time, action.mode)
+        )
+
+        if np.any(detected > 0):
+            self.sInd_detcounts[action.target.sInd] += 1
+            self.sInd_dettimes[action.target.sInd] = (
+                self.sInd_dettimes.get(action.target.sInd) or []
+            ) + [TK.currentTimeNorm.copy().to("day")]
+
+        _drm_entry["det_time"] = action.int_time
+
+        # populate the DRM with detection results
+        _drm_entry["det_status"] = detected
+        _drm_entry["det_fZ"] = det_fZ.to(self.fZ_unit)
+        _drm_entry["det_params"] = det_systemParams
+        _drm_entry["det_SNR"] = det_SNR
+        if np.any(_meta["plan_inds"]):
+            _drm_entry["det_JEZ"] = det_JEZ
+            _drm_entry["det_dMag"] = SU.dMag[_meta["plan_inds"]].tolist()
+            _drm_entry["det_WA"] = SU.WA[_meta["plan_inds"]].to(u.mas).value.tolist()
+
+        if action.int_time is not None:
+            det_comp = Comp.comp_per_intTime(
+                action.int_time << u.d,
+                TL,
+                action.target.sInd,
+                det_fZ,
+                TL.JEZ0[action.mode["hex"]][action.target.sInd],
+                TL.int_WA[action.target.sInd],
+                action.mode,
+            )[0]
+            _drm_entry["det_comp"] = det_comp
+        else:
+            _drm_entry["det_comp"] = 0.0
+
+        # handle case of inf OBs and missionPortion < 1
+        # if np.isinf(TK.OBduration) and (TK.missionPortion < 1.0):
+        #     self.arbitrary_time_advancement(TK.currentTimeAbs.mjd - action.start)
+        _drm_entry["det_mode"] = dict(action.mode)
+        _drm_entry["det_mode"].pop("inst", None)
+        _drm_entry["det_mode"].pop("syst", None)
+
+        return ObservationResult(data=_drm_entry, meta=_meta)
+
+    def do_characterization(self, action):
+        TK, TL, SU, Comp = (
+            self.TimeKeeping,
+            self.TargetList,
+            self.SimulatedUniverse,
+            self.Completeness,
+        )
+
+        # Bookkeeping
+        self.starVisits[action.target.sInd] += 1
+        self.char_starVisits[action.target.sInd] += 1
+        sInd = action.target.sInd
+
+        # Execute the characterization with each mode
+        # we're making an observation so increment observation number
+        self.ObsNum += 1
+        char_info = []
+        _int_time = action.int_time.copy() << u.d
+        for mode_index, char_mode in enumerate(self.char_modes):
+            char_data = {}
+            (
+                characterized,
+                char_fZ,
+                char_JEZ,
+                char_systemParams,
+                char_SNR,
+                char_intTime,
+            ) = self.observation_characterization(
+                sInd, char_mode, mode_index, _int_time
+            )
+
+            assert char_intTime != 0, "Integration time can't be 0."
+
+            # populate the DRM with characterization results
+            char_data["char_time"] = (
+                char_intTime.to("day") if char_intTime is not None else self.zero_d
+            )
+            # WAS ... = characterized[:-1] if FA else characterized
+            char_data["char_status"] = characterized
+            # WAS ... = char_SNR[:-1] if FA else char_SNR
+            char_data["char_SNR"] = char_SNR
+            char_data["char_fZ"] = char_fZ.to(self.fZ_unit)
+            char_data["char_params"] = char_systemParams
+
+            if char_intTime is not None and np.any(characterized):
+                char_comp = Comp.comp_per_intTime(
+                    char_intTime,
+                    TL,
+                    sInd,
+                    char_fZ,
+                    TL.JEZ0[char_mode["hex"]][sInd],
+                    TL.int_WA[sInd],
+                    char_mode,
+                )[0]
+                char_data["char_comp"] = char_comp
+            else:
+                char_data["char_comp"] = 0.0
+            # The FA block in coroOnlyScheduler used an old FA value so I'm ignoring it
+            # populate the DRM with observation modes
+            char_data["char_mode"] = dict(char_mode)
+            # remove the inst and syst keys from the char_mode dict
+            char_data["char_mode"].pop("inst", None)
+            char_data["char_mode"].pop("syst", None)
+            char_data["exoplanetObsTime"] = TK.exoplanetObsTime.copy()
+            char_info.append(char_data)
+
+        data = dict(char_info=char_info)
+        meta = self._build_meta(action)
+
+        return ObservationResult(data=data, meta=meta)
+
+    def _build_meta(self, action):
+        """fields every DRM entry needs, regardless of purpose"""
+        plan_inds = np.where(self.SimulatedUniverse.plan2star == action.target.sInd)[0]
+        return dict(
+            purpose=action.purpose,
+            star_ind=action.target.sInd,
+            star_name=self.TargetList.Name[action.target.sInd],
+            arrival_time=action.start,
+            OB_nb=self.TimeKeeping.OBnumber,
+            ObsNum=self.ObsNum,
+            plan_inds=plan_inds,
+        )
+
+    def _colorize_planet_indices(self, plan_inds, status):
+        """
+        Return a string of planet indices, green if detected, red if not.
+        Args:
+            plan_inds: array-like of planet indices
+            status: array-like of detection status (1=detected, 0=not)
+        Returns:
+            str: colorized indices for terminal output
+        """
+        indices = []
+        for idx, detected in zip(plan_inds, status):
+            # Get the planet track if it exists
+            key = (self.SimulatedUniverse.plan2star[idx], int(idx))
+            track = self.planet_tracks.get(key)
+
+            # Default label is just the detection status
+            if detected > 0:
+                label = "+"  # Detected this observation
+            elif detected < 0:
+                label = str(detected)  # Special status (-1 for IWA, -2 for OWA)
+            else:
+                label = "0"  # Not detected
+
+            # If we have a track, use the D/C notation
+            if track is not None:
+                if track.char_successes > 0:
+                    # Planet is in characterization phase
+                    label = f"C{track.char_successes}"
+                    color = "\033[92m"  # Green
+                else:
+                    # Planet is in detection phase
+                    label = f"D{track.det_successes}"
+                    color = "\033[94m"  # Blue
+            else:
+                # No track - use default colors based on current detection
+                if detected > 0:
+                    color = "\033[92m"  # Green
+                else:
+                    color = "\033[91m"  # Red
+
+            indices.append(f"{color}{idx}[{label}]\033[0m")
+
+        return "(" + ", ".join(indices) + ")"
+
+    def log_obs(self, action):
+        """
+        Helper function to log an aligned, single-line summary of the observation.
+        Also prints a second line with integration time, number of planets, and color-coded planet indices.
+        """
+        if action.purpose == "general_astrophysics":
+            return
+        # Start by just adding the action to our history list
+        self.history.append(action)
+
+        # Create log information
+        TL, TK = self.TargetList, self.TimeKeeping
+        visit_number = self.starVisits[action.target.sInd]
+        det_visit_number = self.det_starVisits[action.target.sInd]
+        char_visit_number = self.char_starVisits[action.target.sInd]
+        exo_obs_time = TK.allocated_time_d - TK.exoplanetObsTime.to_value(u.d)
+
+        # In case the action has no int_time, set the int_time_str to "-"
+        int_time_str = "-"
+        if hasattr(action, "int_time") and action.int_time is not None:
+            int_time_str = f"{action.int_time:.2f} d"
+
+        # Color characterizations green
+        _purpose = (
+            "\033[92mChar\033[0m" if action.purpose == "characterization" else "Det"
+        )
+
+        # Get planet indices and detection status
+        plan_inds = (
+            action.result.meta["plan_inds"]
+            if len(action.result.meta["plan_inds"]) > 0
+            else []
+        )
+        if action.purpose == "detection":
+            status = (
+                action.result.data["det_status"]
+                if action.result.data["det_status"] is not None
+                else np.zeros(len(plan_inds), dtype=int)
+            )
+        elif action.purpose == "characterization":
+            if action.result.data.get("char_info"):
+                status = action.result.data["char_info"][-1].get(
+                    "char_status", np.zeros(len(plan_inds), dtype=int)
+                )
+            else:
+                status = np.zeros(len(plan_inds), dtype=int)
+        else:
+            status = np.zeros(len(plan_inds), dtype=int)
+
+        # Get and display mission statistics first
+        stats, mission_header = self.get_mission_stats(action)
+
+        # Format the observation summary
+        obs_info = (
+            f"Observation #{self.ObsNum:4d} | "
+            f"{_purpose:<4} | "
+            f"IntTime: {int_time_str} | "
+            f"Star {action.target.sInd:3d} | "
+            f"Visit {visit_number:2d} (det {det_visit_number:2d}, char {char_visit_number:2d}) | "
+        )
+
+        # Get detailed planet info
+        planet_details = []
+        if len(plan_inds) > 0:
+            for i, p_idx in enumerate(plan_inds):
+                key = (self.SimulatedUniverse.plan2star[p_idx], int(p_idx))
+                track = self.planet_tracks.get(key)
+                if track:
+                    if track.char_successes > 0:
+                        stage_info = (
+                            f"C{track.char_successes}/{self.required_char_successes}"
+                        )
+                    else:
+                        stage_info = (
+                            f"D{track.det_successes}/{self.required_det_successes}"
+                        )
+                    det_status = "+" if status[i] > 0 else "0"
+                    planet_details.append(f"P{p_idx}: {stage_info} ({det_status})")
+
+        planet_info = " | ".join(planet_details) if planet_details else "No planets"
+        results_line = f"Results: {self._colorize_planet_indices(plan_inds, status)} | {planet_info}"
+
+        # Combine everything into a single custom formatted output
+        # Split the mission header to inject our observation info before the closing line
+        header_parts = mission_header.strip().split("\n")
+
+        # Assemble the combined output
+        combined_output = "\n".join(header_parts[:-1])  # All except last line
+        combined_output += f"\n{obs_info}\n{results_line}\n"
+        combined_output += header_parts[-1]  # Add the closing line
+
+        self.logger.info(combined_output)
+        self.vprint(combined_output)
+
+        # Add observation to DRM
+        self.DRM.append(action.result.to_drm())
+
+    def _format_mission_stats(self, stats, changes, action):
+        """Format mission statistics into a readable summary string."""
+        # Basic mission stats
+        lines = [
+            "\n══════════════ MISSION TRACKER ══════════════",
+            f"Unique stars: {stats['total_stars_visited']} | "
+            + f"Planets: {stats['detected_planets']} detected | Comp: {stats['comp']:.2f}",
+            f"Active planet tracks: {stats['active_planets']} | {stats['future_scheduled_observations']} scheduled",
+            # Total number of blind observations | Number of scheduled observations carried out
+            f"Observations: {stats['blind_observations']} blind | {stats['past_scheduled_observations']} scheduled",
+        ]
+
+        # Combine detection and characterization stages on a single line
+        stages_str = "Stages: "
+        det_changes = changes.get("det_stage_changes", {}) if changes else {}
+        char_changes = changes.get("char_stage_changes", {}) if changes else {}
+
+        # First add all detection stages
+        for stage in range(1, self.required_det_successes + 1):
+            count = stats["detection_stages"].get(stage, 0)
+            stage_diff = det_changes.get(stage, 0)
+
+            # Format the stage count with highlighting if it changed
+            if stage_diff > 0:
+                stages_str += f"D{stage}: \033[94m{count}\033[0m | "  # Blue for increase in detection
+            elif stage_diff < 0:
+                stages_str += f"D{stage}: \033[91m{count}\033[0m | "  # Red for decrease
+            else:
+                stages_str += f"D{stage}: {count} | "
+
+        # Then add all characterization stages
+        for stage in range(1, self.required_char_successes + 1):
+            count = stats["characterization_stages"].get(stage, 0)
+            stage_diff = char_changes.get(stage, 0)
+
+            # Format the stage count with highlighting if it changed
+            if stage_diff > 0:
+                stages_str += f"C{stage}: \033[92m{count}\033[0m | "  # Green for increase in characterization
+            elif stage_diff < 0:
+                stages_str += f"C{stage}: \033[91m{count}\033[0m | "  # Red for decrease
+            else:
+                stages_str += f"C{stage}: {count} | "
+
+        lines.append(stages_str[:-3])  # Remove the last " | "
+
+        # Completed characterizations
+        chars_completed = stats["chars_completed"]
+        chars_diff = changes.get("new_chars", 0) if changes else 0
+
+        # Highlight completed characterizations if changed
+        if chars_diff > 0:
+            lines.append(
+                f"Completed characterizations: \033[92m{chars_completed}\033[0m"
+            )
+        else:
+            lines.append(f"Completed characterizations: {chars_completed}")
+
+        # Observation time stats with percentage
+        lines.append(
+            f"Observation time: {stats['used_time']:.2f}/{stats['total_time']:.2f} days used ({stats['percent_used']:.1f}%)"
+        )
+        obs_year = self.TimeKeeping.currentTimeAbs.decimalyear
+        end_time = self.TimeKeeping.missionFinishAbs.decimalyear
+        start_time = self.TimeKeeping.missionStart.decimalyear
+        fraction_remaining = (
+            100 * (obs_year - start_time) / self.TimeKeeping.missionLife.to_value(u.yr)
+        )
+        lines.append(
+            f"Mission time: {obs_year:6.2f}/{end_time:6.2f} ({fraction_remaining:.2f}%)"
+        )
+        lines.append("═════════════════════════════════════════════")
+        return "\n".join(lines)
+
+    def get_mission_stats(self, action=None):
+        """
+        Generate mission statistics summary, highlighting changes from the last observation.
+
+        Returns:
+            dict: Current mission statistics
+            str: Formatted summary string for logging
+        """
+        SU = self.SimulatedUniverse
+        TK = self.TimeKeeping
+
+        # Track previous stats if we're tracking changes
+        prev_stats = getattr(self, "_prev_mission_stats", None)
+
+        # Calculate observation time stats
+        # available_time = self._available_obs_time()
+        available_time = TK.allocated_time_d - TK.exoplanetObsTime.to_value(u.d)
+        total_time = TK.allocated_time_d
+        used_time = total_time - available_time
+        percent_used = (used_time / total_time) * 100 if total_time > 0 else 0
+
+        # Initialize stats dictionary
+        stats = {
+            "total_planets": SU.nPlans,
+            "detected_planets": len(
+                self._all_detected_planets
+            ),  # Use the set of all detected planets
+            "comp": sum(action.comp for action in self.history),
+            "active_planets": len(self.planet_tracks),
+            "fraction_detected": len(self._all_detected_planets) / SU.nPlans
+            if SU.nPlans > 0
+            else 0,
+            "total_stars_visited": np.sum(self.starVisits > 0),
+            "total_observations": self.ObsNum,
+            "blind_observations": sum(1 for action in self.history if action.blind),
+            "future_scheduled_observations": len(self.schedule),
+            "past_scheduled_observations": sum(
+                1 for action in self.history if not action.blind
+            ),
+            "detection_stages": {i + 1: 0 for i in range(self.required_det_successes)},
+            "characterization_stages": {
+                i + 1: 0 for i in range(self.required_char_successes)
+            },
+            "chars_completed": 0,
+            "available_time": available_time,
+            "total_time": total_time,
+            "used_time": used_time,
+            "percent_used": percent_used,
+        }
+
+        # Count planets at each detection and characterization stage
+        for track in self.planet_tracks.values():
+            if track.char_successes > 0:
+                # Planet is in characterization phase
+                if track.char_successes <= self.required_char_successes:
+                    stats["characterization_stages"][track.char_successes] += 1
+            else:
+                # Planet is in detection phase
+                if track.det_successes <= self.required_det_successes:
+                    stats["detection_stages"][track.det_successes] += 1
+
+        # Calculate completed characterizations (planets that finished all stages)
+        if hasattr(self, "_completed_planets"):
+            stats["chars_completed"] = len(self._completed_planets)
+        else:
+            self._completed_planets = set()
+            stats["chars_completed"] = 0
+
+        # Identify changes if we have a previous state and current action
+        changes = {}
+        if prev_stats and action:
+            changes["new_detections"] = (
+                stats["detected_planets"] - prev_stats["detected_planets"]
+            )
+            changes["new_chars"] = (
+                stats["chars_completed"] - prev_stats["chars_completed"]
+            )
+
+            # Track detection stage changes
+            det_stage_changes = {}
+            for stage in stats["detection_stages"]:
+                diff = stats["detection_stages"][stage] - prev_stats[
+                    "detection_stages"
+                ].get(stage, 0)
+                if diff != 0:
+                    det_stage_changes[stage] = diff
+            changes["det_stage_changes"] = det_stage_changes
+
+            # Track characterization stage changes
+            char_stage_changes = {}
+            for stage in stats["characterization_stages"]:
+                diff = stats["characterization_stages"][stage] - prev_stats[
+                    "characterization_stages"
+                ].get(stage, 0)
+                if diff != 0:
+                    char_stage_changes[stage] = diff
+            changes["char_stage_changes"] = char_stage_changes
+
+        # Store current stats for next comparison
+        self._prev_mission_stats = stats.copy()
+
+        # Format the summary string
+        summary = self._format_mission_stats(
+            stats, changes if prev_stats else None, action
+        )
+
+        return stats, summary
+
+    def plot_observation_results(
+        self, sInd, pInds, mode, intTime, SNR, purpose="detection", save_dir="plots"
+    ):
+        """
+        Create diagnostic plots for observation results.
+
+        Args:
+            sInd (int): Star index
+            pInds (array): Planet indices
+            mode (dict): Observation mode
+            intTime (astropy.Quantity): Integration time
+            SNR (array): Signal-to-noise ratios
+            purpose (str): 'detection' or 'characterization'
+            save_dir (str): Directory to save plots
+
+        Returns:
+            str: Path to the saved plot file
+        """
+        import os
+
+        import matplotlib.pyplot as plt
+
+        # Filter pInds and SNR to only those present in SU.orbix_planets
+        SU = self.SimulatedUniverse
+        valid_indices = [i for i, pInd in enumerate(pInds) if pInd in SU.orbix_planets]
+        if not valid_indices:
+            return None
+        filtered_pInds = [pInds[i] for i in valid_indices]
+        filtered_SNR = [SNR[i] for i in valid_indices]
+
+        # Create directories if they don't exist
+        os.makedirs(save_dir, exist_ok=True)
+
+        TL = self.TargetList
+        TK = self.TimeKeeping
+
+        # Create subplots
+        fig, axs = plt.subplots(
+            nrows=len(filtered_pInds),
+            ncols=3,
+            figsize=(12, 5 * len(filtered_pInds)),
+            squeeze=False,  # Always return 2D array
+        )
+
+        # Add supertitle with observation details
+        supertitle = f"{TL.Name[sInd]} - {purpose.capitalize()} - Integration Time: {intTime.to('day').value:.2f} days, SNRs: ["
+        for i, _SNR in enumerate(filtered_SNR):
+            supertitle += f"{_SNR:.2f}"
+            if i < len(filtered_SNR) - 1:
+                supertitle += ", "
+        supertitle += "]"
+        fig.suptitle(supertitle)
+
+        # Get observation time and grid data
+        _dMag0Grid = self.dMag0s[mode["hex"]][sInd]
+        _dMag0_intTimes = _dMag0Grid.int_times
+        int_time_ind = np.searchsorted(_dMag0_intTimes, intTime.to_value(u.d))
+        if int_time_ind >= len(_dMag0_intTimes):
+            int_time_ind = len(_dMag0_intTimes) - 1
+        fZ = self.ZodiacalLight.fZMap[mode["syst"]["name"]][sInd]
+        koMask = self.koMaps[mode["syst"]["name"]][sInd]
+        times = self.koTimes.mjd - TK.missionStart.mjd
+        time_ind = np.argmin(np.abs(times - self.propagTimes[sInd].to_value(u.d)))
+        _t = jnp.array([times[time_ind]])
+
+        for i, pInd in enumerate(filtered_pInds):
+            # Get the axes for the current row
+            ax0 = axs[i, 0]
+            ax1 = axs[i, 1]
+            ax2 = axs[i, 2]
+
+            orbix_planets = SU.orbix_planets[pInd]
+
+            # Get planet track info
+            key = (sInd, int(pInd))
+            track = self.planet_tracks.get(key)
+            stage_info = ""
+            if track:
+                if track.char_successes > 0:
+                    stage_info = (
+                        f" - C{track.char_successes}/{self.required_char_successes}"
+                    )
+                else:
+                    stage_info = (
+                        f" - D{track.det_successes}/{self.required_det_successes}"
+                    )
+
+            # alpha vs dMag
+            alpha, dMag = orbix_planets.j_alpha_dMag(self.solver, _t)
+
+            pdet = _dMag0Grid.pdet_planets(self.solver, times, orbix_planets, fZ)
+            _pdet = pdet[time_ind, int_time_ind]
+            ax0.plot(
+                alpha,
+                dMag,
+                label="Orbix Planets",
+                linestyle="none",
+                marker=".",
+                alpha=0.3,
+            )
+            _alpha_real_arcsec = SU.WA[pInd].to_value(u.arcsec)
+            _dMag_real = SU.dMag[pInd]
+            ax0.scatter(
+                _alpha_real_arcsec,
+                _dMag_real,
+                label="EXOSIMS Planet",
+                marker="x",
+                color="red",
+                s=100,
+                zorder=5,
+            )
+            ax0.set_xlabel("Separation [arcsec]")
+            ax0.set_ylabel("$\\Delta$mag")
+            ax0.set_title(
+                f"Planet {pInd}{stage_info} - pdet: {float(_pdet):.2f} - SNR: {filtered_SNR[i]:.2f}"
+            )
+            ax0.set_xlim(0, 0.25)
+            ax0.set_ylim(15, 40)
+            ax0.axvline(
+                mode["IWA"].to_value(u.arcsec),
+                color="red",
+                linestyle="--",
+                label="IWA",
+            )
+            ax0.axvline(
+                mode["OWA"].to_value(u.arcsec),
+                color="orange",
+                linestyle="--",
+                label="OWA",
+            )
+            ax0.legend()
+            ax0.grid(True, alpha=0.5)
+
+            # plot position
+            pos = orbix_planets.j_prop_AU(self.solver, _t)
+            pos_real = SU.r[pInd].to_value(u.AU)
+
+            ax1.scatter(
+                pos[:, 0],
+                pos[:, 1],
+                label="Orbix Planets",
+                alpha=0.3,
+                marker=".",
+            )
+            ax1.scatter(
+                pos_real[0],
+                pos_real[1],
+                label="EXOSIMS Planet",
+                marker="x",
+                color="red",
+                s=100,
+                zorder=5,  # Ensure it's visible
+            )
+            ax1.set_xlabel("X [AU]")
+            ax1.set_ylabel("Y [AU]")
+            ax1.set_xlim(-2.5, 2.5)
+            ax1.set_ylim(-2.5, 2.5)
+            ax1.set_title(f"X vs Y - Planet {pInd}{stage_info}")
+            ax1.legend()
+            ax1.grid(True, alpha=0.5)
+
+            # pdet heatmap
+            TT, IT = np.meshgrid(times, _dMag0_intTimes)  # both (Ni, Nt)
+
+            pcm = ax2.pcolormesh(
+                TT,
+                IT,
+                pdet.T,
+                shading="auto",  # let MPL infer the correct cell edges
+                cmap="viridis",
+            )
+
+            fig.colorbar(pcm, ax=ax2, label="p(det)")
+
+            ax2.set_xlabel("Time [days]")
+            ax2.set_ylabel("Integration Time [days]")
+            ax2.set_xlim(times[0], times[-1])
+            ax2.set_ylim(
+                _dMag0_intTimes[0],
+                _dMag0_intTimes[-1],
+            )
+
+            # Mark detection times with vertical lines
+            if sInd in self.sInd_dettimes:
+                for _time in self.sInd_dettimes[sInd]:
+                    ax2.axvline(
+                        _time.to_value(u.d),
+                        color="blue",
+                        linestyle="--",
+                        label="Detection" if i == 0 else "",
+                    )
+
+            # Mark current time
+            ax2.axvline(
+                times[time_ind],
+                color="red",
+                linestyle="--",
+                label="Current time" if i == 0 else "",
+            )
+
+            # Add legend for the time plot if it's the first planet
+            if i == 0:
+                ax2.legend()
+
+        plt.tight_layout()
+
+        # Save the figure
+        filename = f"{save_dir}/{self.ObsNum}_{purpose}_{sInd}.png"
+        # plt.show()
+        plt.savefig(filename, dpi=300)
+        plt.close(fig)
+
+        self.logger.info(f"Saved observation plot to {filename}")
+
+        return filename
+
+    def _plot_scheduling_attempt(
+        self,
+        track,
+        times,
+        int_times,
+        pdet,
+        threshold,
+        mode,
+        ko_status=None,  # Now expected to be a 2D mask: (n_times, n_int_times)
+        schedule_conflicts=None,
+        time_limits=None,
+        mission_limits=None,
+        result=None,
+        selected_time=None,
+        selected_int=None,
+    ):
+        """
+        Create diagnostic plots for scheduling attempts to help diagnose why characterization
+        observations aren't being scheduled.
+
+        Args:
+            track (PlanetTrack): The planet track being scheduled
+            times (array): Array of candidate observation times
+            int_times (array): Array of candidate integration times
+            pdet (array): 2D array of detection probabilities (times x int_times)
+            threshold (float): Detection threshold being used
+            mode (dict): Observation mode
+            ko_status (2D array, optional): Boolean mask (n_times, n_int_times) indicating if the observation window is fully observable (True) or not (False)
+            schedule_conflicts (array, optional): Boolean mask of scheduling conflicts
+            time_limits (array, optional): Boolean mask of integration time limits
+            mission_limits (array, optional): Boolean mask of mission time limits
+            result (str, optional): Result of scheduling attempt ("success", "threshold_failure", etc.)
+            selected_time (float, optional): Selected observation time
+            selected_int (float, optional): Selected integration time
+
+        Returns:
+            str: Path to the saved plot file
+        """
+        import os
+
+        import matplotlib.pyplot as plt
+
+        # Create directory if it doesn't exist
+        save_dir = os.path.join(self.plot_dir, "scheduling")
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Get star and planet info
+        sInd, pInd = track.sInd, track.pInd
+        star_name = self.TargetList.Name[sInd]
+        star_dist = self.TargetList.dist[sInd].to_value(u.pc)
+        a = self.SimulatedUniverse.a[pInd].to_value(u.AU)  # Semi-major axis
+        radius = self.SimulatedUniverse.Rp[pInd].to_value(u.earthRad)
+
+        is_char = mode == self.base_char_mode
+        observation_type = "Characterization" if is_char else "Detection"
+
+        # Create a 2x2 grid of subplots
+        fig, axs = plt.subplots(2, 2, figsize=(15, 12), constrained_layout=True)
+
+        # Add a title with relevant information
+        status_info = f"Status: {result}" if result else ""
+        det_status = f"D{track.det_successes}/{self.required_det_successes}"
+        char_status = f"C{track.char_successes}/{self.required_char_successes}"
+        fig.suptitle(
+            f"{star_name} ({star_dist:.2f} pc) - Planet {pInd} ({radius:.1f} R⊕, {a:.2f} AU) - {observation_type} Scheduling\n"
+            f"{det_status}, {char_status} - Max pdet: {np.max(pdet):.3f}, Threshold: {threshold:.3f} - {status_info}",
+            fontsize=16,
+        )
+
+        # Plot 1: Detection probability heatmap (times x int_times)
+        TT, IT = np.meshgrid(times, int_times)  # both (Ni, Nt)
+        im1 = axs[0, 0].pcolormesh(
+            TT,
+            IT,
+            pdet.T,
+            shading="auto",
+            cmap="viridis",
+            vmin=0,
+            vmax=max(1.0, np.max(pdet)),
+        )
+        fig.colorbar(im1, ax=axs[0, 0], label="p(det)")
+
+        # Highlight the selected point if available
+        if selected_time is not None and selected_int is not None:
+            axs[0, 0].plot(
+                selected_time, selected_int, "rx", markersize=10, label="Selected"
+            )
+            axs[0, 0].legend()
+
+        axs[0, 0].set_xlabel("Time (days from mission start)")
+        axs[0, 0].set_ylabel("Integration Time (days)")
+        axs[0, 0].set_title("Detection Probability")
+
+        # Plot 2: Constraint mask heatmap
+        # Create a composite constraint mask
+        composite_mask = np.zeros_like(pdet, dtype=float)
+        mask_labels = []
+
+        # Define colors for different constraints
+        constraint_colors = {
+            "below_threshold": [1.0, 0.7, 0.7],  # Light red
+            "keepout": [0.7, 0.7, 1.0],  # Light blue
+            "schedule_conflict": [1.0, 0.7, 1.0],  # Light purple
+            "time_limit": [0.7, 1.0, 0.7],  # Light green
+            "mission_limit": [1.0, 1.0, 0.7],  # Light yellow
+        }
+
+        # Create a custom colormap for constraints
+        cmap_colors = [(1, 1, 1)]  # Start with white for no constraints
+        for color in constraint_colors.values():
+            cmap_colors.append(color)
+        custom_cmap = LinearSegmentedColormap.from_list(
+            "custom_constraints", cmap_colors, N=len(constraint_colors) + 1
+        )
+
+        # Apply each constraint mask
+        # 0 = valid, 1-5 = invalid for different reasons
+        if pdet is not None:
+            below_threshold = pdet < threshold
+            composite_mask[below_threshold] = 1
+            mask_labels.append(
+                ("Below threshold", constraint_colors["below_threshold"])
+            )
+
+        if ko_status is not None:
+            # ko_status is now a 2D mask: (n_times, n_int_times)
+            # False means not observable for the full duration
+            not_observable_mask = ~ko_status
+            composite_mask[not_observable_mask] = 2
+            mask_labels.append(("Keepout", constraint_colors["keepout"]))
+
+        if schedule_conflicts is not None:
+            composite_mask[schedule_conflicts] = 3
+            mask_labels.append(
+                (
+                    "Scheduled observation conflict",
+                    constraint_colors["schedule_conflict"],
+                )
+            )
+
+        if time_limits is not None:
+            time_exceeded = ~time_limits
+            composite_mask[time_exceeded] = 4
+            mask_labels.append(
+                ("Exceeds available integration time", constraint_colors["time_limit"])
+            )
+
+        if mission_limits is not None:
+            mission_exceeded = ~mission_limits
+            composite_mask[mission_exceeded] = 5
+            mask_labels.append(
+                ("Exceeds mission lifetime", constraint_colors["mission_limit"])
+            )
+
+        # Create mask plot
+        im2 = axs[0, 1].pcolormesh(
+            TT,
+            IT,
+            composite_mask.T,
+            shading="auto",
+            cmap=custom_cmap,
+            vmin=0,
+            vmax=len(constraint_colors),
+        )
+
+        # Add custom legend for mask plot
+        from matplotlib.patches import Patch
+
+        legend_elements = [Patch(facecolor="white", edgecolor="black", label="Valid")]
+        for label, color in mask_labels:
+            legend_elements.append(
+                Patch(facecolor=color, edgecolor="black", label=label)
+            )
+        axs[0, 1].legend(handles=legend_elements, loc="upper right")
+
+        # Highlight the selected point if available
+        if selected_time is not None and selected_int is not None:
+            axs[0, 1].plot(selected_time, selected_int, "rx", markersize=10)
+
+        axs[0, 1].set_xlabel("Time (days from mission start)")
+        axs[0, 1].set_ylabel("Integration Time (days)")
+        axs[0, 1].set_title("Constraint Visualization")
+
+        # Plot 3: Maximum pdet over time for each integration time
+        for i, int_time in enumerate(int_times):
+            if i % 5 == 0:  # Only plot every 5th integration time to avoid clutter
+                axs[1, 0].plot(times, pdet[:, i], label=f"{int_time:.2f} days")
+
+        # Add threshold line
+        axs[1, 0].axhline(
+            y=threshold, color="r", linestyle="--", label=f"Threshold ({threshold:.2f})"
+        )
+
+        # Highlight the selected point if available
+        if selected_time is not None and selected_int is not None:
+            selected_idx = np.argmin(np.abs(int_times - selected_int))
+            if selected_idx < pdet.shape[1]:
+                time_idx = np.argmin(np.abs(times - selected_time))
+                if time_idx < pdet.shape[0]:
+                    axs[1, 0].plot(
+                        selected_time, pdet[time_idx, selected_idx], "rx", markersize=10
+                    )
+
+        axs[1, 0].set_xlabel("Time (days from mission start)")
+        axs[1, 0].set_ylabel("p(det)")
+        axs[1, 0].set_title("Detection Probability vs Time")
+        axs[1, 0].legend(loc="best")
+        axs[1, 0].grid(True, alpha=0.3)
+
+        # Plot 4: Alpha vs dMag over time
+        # Get planet properties
+        planets = self.SimulatedUniverse.orbix_planets[pInd]
+
+        # Convert times to the format expected by orbix
+        jax_times = jnp.array(times)
+
+        # Get alpha and dMag values for all times
+        alphas, dMags = planets.j_alpha_dMag(self.solver, jax_times)
+
+        # Create a colormap based on time
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+
+        norm = Normalize(vmin=times[0], vmax=times[-1])
+        time_cmap = plt.cm.plasma
+        sm = ScalarMappable(norm=norm, cmap=time_cmap)
+        sm.set_array([])
+
+        # Plot alpha vs dMag with colors representing time
+        sc = axs[1, 1].scatter(
+            alphas,
+            dMags,
+            c=jnp.repeat(jax_times, alphas.shape[0]),
+            cmap=time_cmap,
+            alpha=0.5,
+            s=2,
+        )
+        cbar = fig.colorbar(sm, ax=axs[1, 1])
+        cbar.set_label("Time (days from mission start)")
+
+        # Get current alpha and dMag for the planet from SimulatedUniverse
+        current_alpha = self.SimulatedUniverse.WA[pInd].to_value(u.arcsec)
+        current_dMag = self.SimulatedUniverse.dMag[pInd]
+
+        # Mark the current position
+        axs[1, 1].scatter(
+            current_alpha,
+            current_dMag,
+            marker="*",
+            color="red",
+            s=150,
+            label="Current position",
+            zorder=10,
+        )
+
+        # Draw IWA and OWA lines
+        iwa = mode["IWA"].to_value(u.arcsec)
+        owa = mode["OWA"].to_value(u.arcsec)
+        axs[1, 1].axvline(x=iwa, color="r", linestyle="--", label=f'IWA ({iwa:.3f}")')
+        axs[1, 1].axvline(
+            x=owa, color="orange", linestyle="--", label=f'OWA ({owa:.3f}")'
+        )
+
+        # Set axis limits
+        axs[1, 1].set_xlim(0, max(0.25, owa * 1.1))  # Slightly wider than OWA
+        axs[1, 1].set_ylim(min(15, current_dMag - 2), max(28, current_dMag + 2))
+
+        axs[1, 1].set_xlabel("Separation (arcsec)")
+        axs[1, 1].set_ylabel("$\Delta$mag")
+        axs[1, 1].set_title("Alpha vs dMag Over Time")
+        axs[1, 1].grid(True, alpha=0.3)
+        axs[1, 1].legend(loc="upper right")
+
+        # Add specific information about the scheduling result
+        info_text = f"Planet Track: sInd={sInd}, pInd={pInd}\n"
+        info_text += f"Detection Successes: {track.det_successes}/{self.required_det_successes}\n"
+        info_text += f"Characterization Successes: {track.char_successes}/{self.required_char_successes}\n"
+        info_text += f"Last Observation: {track.last_obs_mjd - self.TimeKeeping.missionStart.mjd:.2f} days\n"
+        info_text += f"Result: {result}"
+
+        if result == "success" or result == "bump_success":
+            info_text += f"\nSelected Time: {selected_time:.2f} days\n"
+            info_text += f"Selected Integration Time: {selected_int:.2f} days"
+            if selected_time is not None and selected_int is not None:
+                time_idx = np.argmin(np.abs(times - selected_time))
+                int_idx = np.argmin(np.abs(int_times - selected_int))
+                if time_idx < pdet.shape[0] and int_idx < pdet.shape[1]:
+                    info_text += f"\nSelected pdet: {pdet[time_idx, int_idx]:.3f}"
+
+        # Add text box with information
+        props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
+        axs[1, 1].text(
+            0.02,
+            0.02,
+            info_text,
+            transform=axs[1, 1].transAxes,
+            fontsize=9,
+            verticalalignment="bottom",
+            bbox=props,
+        )
+
+        # Save the figure
+        timestamp = self.TimeKeeping.currentTimeNorm.to_value(u.day)
+        filename = f"{save_dir}/sched_{int(timestamp)}_{observation_type}_{sInd}_{pInd}_{result}.{self.plot_format}"
+        plt.savefig(filename, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+        self.logger.info(f"Saved scheduling attempt plot to {filename}")
+
+        return filename
