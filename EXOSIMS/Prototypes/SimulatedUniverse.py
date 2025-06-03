@@ -185,9 +185,10 @@ class SimulatedUniverse(object):
 
         # Set the number of exozodi
         self.commonSystemnEZ = commonSystemnEZ
-
+        self._outspec["commonSystemnEZ"] = commonSystemnEZ
         # A fixed number of exozodi for every system
         self.fixed_nEZ_val = fixed_nEZ_val
+        self._outspec["fixed_nEZ_val"] = fixed_nEZ_val
 
         # save fixed number of planets to generate
         self.fixedPlanPerStar = fixedPlanPerStar
@@ -604,7 +605,7 @@ class SimulatedUniverse(object):
             pinds = all_pinds
         else:
             pinds = np.intersect1d(all_pinds, pInds)
-        JEZ = JEZ0 * self.nEZ[pinds] * (1 / self.d[pinds].to("AU").value) ** 2
+        JEZ = JEZ0 * self.nEZ[pinds] * (1 / self.d[pinds].to_value(u.AU)) ** 2
         return JEZ
 
     def set_planet_phase(self, beta=np.pi / 2):
