@@ -58,11 +58,15 @@ class Stark(ZodiacalLight):
         # observatory positions vector in heliocentric ecliptic frame
         if currentTimeAbs.size == 1:
             r_obs = Obs.orbit(currentTimeAbs, eclip=True)
-        elif len(np.unique(currentTimeAbs.value)) == 1:
+        elif len(np.unique(currentTimeAbs.value)) == 1 and currentTimeAbs.size == len(
+            sInds
+        ):
+            # Case: same time for multiple stars
             r_obs = Obs.orbit(currentTimeAbs[0], eclip=True)
             # Stack to have shape (nStars, 3)
             r_obs = np.repeat(r_obs, len(sInds), axis=0)
         else:
+            # Case: multiple times (potentially for one or more stars)
             r_obs = Obs.orbit(currentTimeAbs, eclip=True)
         # observatory distance from heliocentric ecliptic frame center
         # (projected in ecliptic plane)
