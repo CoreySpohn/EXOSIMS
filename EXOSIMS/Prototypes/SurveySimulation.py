@@ -436,6 +436,7 @@ class SurveySimulation(object):
         self.Observatory.generate_Earth_interpolator(startTime, endTime, dt)
 
         self._outspec["nokoMap"] = nokoMap
+        self.ko_intervals = {}
         if not (nokoMap):
             koMaps, self.koTimes = self.Observatory.generate_koMap(
                 TL, startTime, endTime, koangles
@@ -445,6 +446,9 @@ class SurveySimulation(object):
             for x, n in zip(systOrder, systNames[systOrder]):
                 print(n)
                 self.koMaps[n] = koMaps[x, :, :]
+            self.ko_intervals = self.Observatory.generate_ko_intervals(
+                TL, self.koMaps, self.koTimes_mjd, endTime.mjd
+            )
 
         self._outspec["nofZ"] = nofZ
 
