@@ -1,10 +1,12 @@
 import time
 import warnings
 from bisect import insort
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Optional
 
+import astropy.constants as const
 import astropy.units as u
 import jax.numpy as jnp
 import numpy as np
@@ -13,7 +15,7 @@ from intervaltree import Interval, IntervalTree
 from orbix.integrations.exosims import dMag0_grid
 from orbix.kepler.shortcuts import get_grid_solver
 
-from EXOSIMS.SurveySimulation.coroOnlyScheduler import coroOnlyScheduler
+from EXOSIMS.Prototypes.SurveySimulation import SurveySimulation
 
 warnings.filterwarnings("ignore", category=UserWarning, module="erfa")
 
@@ -118,6 +120,8 @@ class ScheduleAction:
     comp: float = 0
     pdet: float = 0
     result: Optional[ObservationResult] = None
+    # Predicted values for debugging
+    predicted: Optional[dict] = None
 
     def __post_init__(self):
         self.end = self.start + self.duration
@@ -227,12 +231,13 @@ class StarEnsemble:
     max_dyn_comp_int_time: float = 0.0
 
 
-class OrbixScheduler(coroOnlyScheduler):
+class OrbixScheduler(SurveySimulation):
     """A scheduler that uses orbix to calculate the detection probability."""
 
     def __init__(
         self,
         # err_progression=[0.2, 0.15, 0.05, 0.025, 0.01],
+        n_det_remove=3,
         err_progression=[0.2, 0.1, 0.025],
         followup_wait_d=15,
         followup_horizon_d=500,
@@ -243,14 +248,37 @@ class OrbixScheduler(coroOnlyScheduler):
         max_det_failures=6,
         min_comp_div_int_time=0.5,
         min_int_time_hr=1,
+        n_int_times=100,
         debug_plots=False,
         plot_format="png",
         plot_dir=".",
+        max_requeue_attempts=3,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
+        # Add all parameters to _outspec for proper reset functionality
+        self._outspec["n_det_remove"] = n_det_remove
+        self._outspec["err_progression"] = err_progression
+        self._outspec["followup_wait_d"] = followup_wait_d
+        self._outspec["followup_horizon_d"] = followup_horizon_d
+        self._outspec["pdet_threshold"] = pdet_threshold
+        self._outspec["required_det_successes"] = required_det_successes
+        self._outspec["required_char_successes"] = required_char_successes
+        self._outspec["max_char_failures"] = max_char_failures
+        self._outspec["max_det_failures"] = max_det_failures
+        self._outspec["min_comp_div_int_time"] = min_comp_div_int_time
+        self._outspec["min_int_time_hr"] = min_int_time_hr
+        self._outspec["n_int_times"] = n_int_times
+        self._outspec["debug_plots"] = debug_plots
+        self._outspec["plot_format"] = plot_format
+        self._outspec["plot_dir"] = plot_dir
+        self._outspec["max_requeue_attempts"] = max_requeue_attempts
+
+        self.plot_format = plot_format
+        self.plot_dir = plot_dir
+        self.n_det_remove = n_det_remove
         self.err_progression = err_progression
         # This is in days
         self.followup_wait_d = followup_wait_d
@@ -264,41 +292,11 @@ class OrbixScheduler(coroOnlyScheduler):
         self.min_comp_div_int_time = min_comp_div_int_time
         self.min_int_time = min_int_time_hr * u.hr
         self.min_int_time_d = self.min_int_time.to_value(u.day)
+        self.n_int_times = n_int_times
         self.debug_plots = debug_plots
         self.plot_format = plot_format
         self.plot_dir = plot_dir
-
-        # Create schedule/history observation lists
-        # This format ensures that the schedule is always sorted
-        self.schedule: list[ScheduleAction] = []
-        self._itr = IntervalTree()
-        self.history: list[ScheduleAction] = []
-
-        # Create the planet tracks
-        # Indexed by (sInd, pInd)
-        self.planet_tracks = {}
-        self.retired_tracks = {}
-
-        self.to_requeue = []
-
-        # Track all planets detected throughout the mission
-        self._all_detected_planets = set()
-
-        # Track planets that have completed full characterization
-        self._completed_planets = set()
-
-        # Initialize mission statistics tracking
-        self._prev_mission_stats = None
-
-        # Create the star ensembles
-        self.star_ensembles = {}
-
-        self.promotion_times = {}
-        # choose observing modes selected for detection (default marked with a flag)
-        self.select_default_observing_modes()
-
-        # Initialize all the orbix things
-        self.setup_orbix()
+        self.max_requeue_attempts = max_requeue_attempts
 
     def initializeStorageArrays(self):
         """
@@ -308,6 +306,7 @@ class OrbixScheduler(coroOnlyScheduler):
         self.DRM = []
         OS = self.OpticalSystem
         SU = self.SimulatedUniverse
+        TL = self.TargetList
         allModes = OS.observingModes
         num_char_modes = len(
             list(filter(lambda mode: "spec" in mode["inst"]["name"], allModes))
@@ -324,13 +323,61 @@ class OrbixScheduler(coroOnlyScheduler):
         self.starExtended = np.array([], dtype=int)
         self.lastDetected = np.empty((self.TargetList.nStars, 4), dtype=object)
 
+        self.ignore_stars = []
+        # Number of detections by star index
+        self.sInd_detcounts = np.zeros(TL.nStars, dtype=int)
+        self.sInd_dettimes = {}
+
+        # Create schedule/history observation lists
+        # This format ensures that the schedule is always sorted
+        self.schedule: list[ScheduleAction] = []
+        self._itr = IntervalTree()
+        self.history: list[ScheduleAction] = []
+
+        # Create the planet tracks
+        # Indexed by (sInd, pInd)
+        self.planet_tracks = {}
+        self.retired_tracks = {}
+
+        self.to_requeue = []
+        self.to_requeue_later = {}
+
+        # Track all planets detected throughout the mission
+        self._all_detected_planets = set()
+
+        # Track planets that have completed full characterization
+        self._completed_planets = set()
+
+        # Initialize mission statistics tracking
+        self._prev_mission_stats = None
+
+        # Create the star ensembles
+        self.star_ensembles = {}
+
+        self.promotion_times = {}
+
+        SU.orbix_planets = {}
+
+        # Flag to track if orbix has been set up to prevent multiple setups
+        self._orbix_initialized = False
+
+        # Retry tracking for deferred scheduling
+        self.track_retry_counts = {}  # (sInd, pInd) -> retry_count
+
+        # choose observing modes selected for detection (default marked with a flag)
+        self.select_default_observing_modes()
+
     def setup_orbix(self):
         """Create necessary Orbix objects."""
         OS, SU = self.OpticalSystem, self.SimulatedUniverse
         t0 = self.min_int_time
         tf = OS.intCutoff
         int_times = (
-            np.logspace(np.log10(t0.to_value(u.hr)), np.log10(tf.to_value(u.hr)), 50)
+            np.logspace(
+                np.log10(t0.to_value(u.hr)),
+                np.log10(tf.to_value(u.hr)),
+                self.n_int_times,
+            )
             << u.hr
         )
         nEZs = np.array([SU.fixed_nEZ_val])
@@ -351,14 +398,15 @@ class OrbixScheduler(coroOnlyScheduler):
         """
         TK = self.TimeKeeping
 
+        # Initialize all the orbix things only once per instance
+        if not self._orbix_initialized:
+            self.setup_orbix()
+            self._orbix_initialized = True
+
         # begin survey, and loop until mission is finished
         t0 = time.time()
         self.ObsNum = 0
 
-        from pyinstrument import Profiler
-
-        profiler = Profiler()
-        profiler.start()
         while True:
             # Next target just adds an observation to the schedule (if necessary)
             self.next_action()
@@ -386,6 +434,13 @@ class OrbixScheduler(coroOnlyScheduler):
             if TK.currentTimeAbs.mjd + action.duration > TK.missionFinishAbs.mjd:
                 break
 
+            # Check if the action would violate the allowed observation time
+            if (
+                TK.exoplanetObsTime.to_value(u.day) + action.duration
+                >= TK.allocated_time_d
+            ):
+                break
+
             # Perform the action
             if action.purpose == "detection":
                 # Get the result of the detection and add it to the observation
@@ -396,6 +451,9 @@ class OrbixScheduler(coroOnlyScheduler):
                 # NOTE: I maintain that this is funny
                 # action.result = self.do_worthless_observation(action)
                 pass
+            if action.result is False:
+                # If the action failed to allocate time, break out of the loop
+                break
 
             # Update time to end of the action
             if (action.end - TK.currentTimeAbs.mjd) > 1e-6:
@@ -417,10 +475,10 @@ class OrbixScheduler(coroOnlyScheduler):
         self.logger.info(log_end)
         self.vprint(log_end)
 
+        self.calc_mission_stats()
         # Generate final schedule plot after mission completes
-        self.plot_final_schedule()
-        profiler.stop()
-        profiler.open_in_browser()
+        if self.debug_plots:
+            self.plot_final_schedule()
 
     def plot_final_schedule(self):
         """
@@ -624,8 +682,8 @@ class OrbixScheduler(coroOnlyScheduler):
                         [row, row],
                         "-",
                         color=color,
-                        linewidth=2,
-                        alpha=0.6,
+                        linewidth=4,
+                        alpha=1,
                     )
         # Plot the remaining blind observations
         blind_color = colors["blind_observation"]
@@ -774,7 +832,7 @@ class OrbixScheduler(coroOnlyScheduler):
                 markersize=10,
             ),
         ]
-        ax.legend(handles=legend_elements, loc="best")
+        ax.legend(handles=legend_elements, loc="center right")
 
         # Add title and labels
         ax.set_title("Mission Observation Schedule", fontsize=16)
@@ -792,6 +850,15 @@ class OrbixScheduler(coroOnlyScheduler):
         Called after *every* observation.  Adds future ScheduleActions for
         planet follow-up as needed.
         """
+        completed_track_stage = None
+
+        # Determine the stage of the completed observation
+        if action.target and action.target.kind == "planet":
+            key = (action.target.sInd, action.target.pInd)
+            track = self.planet_tracks.get(key) or self.retired_tracks.get(key)
+            if track:
+                completed_track_stage = track.stage
+
         if action.purpose == "detection" and not action.result.data["det_status"].any():
             # No detection, completeness based response
             self._process_nondetection(action)
@@ -799,6 +866,10 @@ class OrbixScheduler(coroOnlyScheduler):
             self._process_detection(action)
         elif action.purpose == "characterization":
             self._process_characterization(action)
+
+        # After processing the current observation, check for tracks to retry
+        if completed_track_stage is not None:
+            self._process_requeue_later(completed_track_stage)
 
     def _process_nondetection(self, action: ScheduleAction) -> None:
         sInd = action.target.sInd
@@ -890,7 +961,9 @@ class OrbixScheduler(coroOnlyScheduler):
             # This is just a simple way to avoid making a bunch of immediate
             # revisit observations
             max_remaining = ens.best_comp_div_intTime.max()
-            remaining_times = ens.times[ens.best_comp_div_intTime > 0.5 * max_remaining]
+            remaining_times = ens.times[
+                ens.best_comp_div_intTime > 0.75 * max_remaining
+            ]
             first_available_time = remaining_times[0]
             ens.next_available_time = first_available_time
         else:
@@ -1003,18 +1076,10 @@ class OrbixScheduler(coroOnlyScheduler):
             else:
                 # Failed characterization
                 track.failures += 1
-                self.logger.info(
-                    f"CHAR DEBUG: Failed characterization for planet ({sInd},{pInd}). "
-                    f"Failures now {track.failures}/{self.max_char_failures}"
-                )
 
                 if track.failures <= self.max_char_failures:
                     self._queue_followup(track, action)
                 else:
-                    self.logger.info(
-                        f"CHAR DEBUG: Giving up on characterizing planet ({sInd},{pInd}) after "
-                        f"{track.failures} failed attempts."
-                    )
                     # Remove the planet from tracking after too many failures
                     self._retire_track(track)
 
@@ -1036,10 +1101,6 @@ class OrbixScheduler(coroOnlyScheduler):
         if _do_char:
             purpose = "characterization"
             mode = self.base_char_mode
-            self.logger.info(
-                f"CHAR DEBUG: Attempting to schedule characterization for planet ({track.sInd},{track.pInd}) "
-                f"with detection successes={track.det_successes}/{self.required_det_successes}"
-            )
         else:
             purpose = "detection"
             mode = self.base_det_mode
@@ -1057,6 +1118,7 @@ class OrbixScheduler(coroOnlyScheduler):
         threshold_multipliers = [1.0, 1.0, 0.9, 0.5, 0.25]
         t_start, int_time, max_pdet = None, None, 0
         horizon_multipliers = [1, 3, 5, 10, 10]
+        predicted_values = None
 
         # Try each threshold until we find a valid observation or exhaust all options
         for threshold_multiplier, horizon_multiplier in zip(
@@ -1064,20 +1126,18 @@ class OrbixScheduler(coroOnlyScheduler):
         ):
             current_threshold = self.pdet_threshold * threshold_multiplier
             current_horizon = self.followup_horizon_d * horizon_multiplier
-            t_start, int_time, max_pdet, pdet_val = self._calc_optimal_followup(
-                track, current_threshold, mode, current_horizon
+            t_start, int_time, max_pdet, pdet_val, predicted_values = (
+                self._calc_optimal_followup(
+                    track, current_threshold, mode, current_horizon
+                )
             )
             if t_start is not None:
                 # Found a valid observation, break out of the loop
-                self.logger.info(
-                    f"Scheduling follow-up for planet ({track.sInd},{track.pInd}) "
-                    f"with threshold {current_threshold:.3f} (original: {self.pdet_threshold:.3f})"
-                )
                 break
 
         # If all thresholds failed, retire the planet
         if t_start is None:
-            self._retire_track(track)
+            self._queue_for_later_retry(track)
             return
 
         oh = (mode["syst"]["ohTime"] + self.Observatory.settlingTime).to_value(u.day)
@@ -1091,6 +1151,7 @@ class OrbixScheduler(coroOnlyScheduler):
             int_time=int_time,
             blind=False,
             pdet=float(pdet_val),
+            predicted=predicted_values,
         )
         self._add_action(action)
         while self.to_requeue:
@@ -1099,18 +1160,12 @@ class OrbixScheduler(coroOnlyScheduler):
                 tr = self.planet_tracks.get((act.target.sInd, act.target.pInd))
                 if tr is not None:
                     self._queue_followup(tr, act)
-        if _do_char:
-            self.logger.info(
-                f"CHAR DEBUG: Successfully scheduled characterization for planet ({track.sInd},{track.pInd}) "
-                f"at MJD {t_start:.2f} with int_time={int_time:.2f} days"
-            )
 
     def _calc_optimal_followup(self, track, threshold, mode, horizon):
         """Calculate the optimal follow-up time for the given planet track."""
         is_char = mode == self.base_char_mode
-        debug_prefix = "CHAR DEBUG: " if is_char else ""
 
-        TK, ZL = self.TimeKeeping, self.ZodiacalLight
+        TK, ZL, TL = self.TimeKeeping, self.ZodiacalLight, self.TargetList
         _dMag0Grid = self.dMag0s[mode["hex"]][track.sInd]
         planets = self.SimulatedUniverse.orbix_planets[track.pInd]
         # Get the best time to observe
@@ -1121,9 +1176,16 @@ class OrbixScheduler(coroOnlyScheduler):
         prop_times = jnp.linspace(t0, tf, 250, endpoint=False)
         prop_times_mjd = prop_times + TK.missionStart.mjd
         # Get the fZ values from fZMap
-        fZ_inds = np.searchsorted(self.koTimes_mjd, prop_times_mjd, side="right") - 1
-        fZMap = ZL.fZMap[self.base_det_mode["syst"]["name"]]
-        fZ = fZMap[track.sInd, fZ_inds]
+        # fZ_inds = np.searchsorted(self.koTimes_mjd, prop_times_mjd, side="right") - 1
+        # fZMap = ZL.fZMap[self.base_det_mode["syst"]["name"]]
+        # fZ = fZMap[track.sInd, fZ_inds]
+        fZ = ZL.fZ(
+            self.Observatory,
+            TL,
+            np.array([track.sInd]),
+            Time(prop_times_mjd, format="mjd"),
+            mode,
+        ).to_value(self.fZ_unit)
         # Shape is (n_times, n_int_times)
         _int_times = _dMag0Grid.int_times
         _pdet = np.array(
@@ -1131,19 +1193,9 @@ class OrbixScheduler(coroOnlyScheduler):
         )
         max_pdet = np.max(_pdet)
 
-        if is_char:
-            self.logger.info(
-                f"{debug_prefix}Calculating optimal followup for planet ({track.sInd},{track.pInd}): "
-                f"max_pdet={max_pdet:.3f}, threshold={threshold:.3f}, purpose={'characterization' if is_char else 'detection'}"
-            )
-
         # If max_pdet is below threshold, fail early
         if max_pdet < threshold:
             if is_char:
-                self.logger.warning(
-                    f"{debug_prefix}Max pdet {max_pdet:.3f} < threshold {threshold:.3f}, failing early"
-                )
-
                 # Create debug plot for failed scheduling attempt
                 if hasattr(self, "debug_plots") and self.debug_plots:
                     self._plot_scheduling_attempt(
@@ -1160,7 +1212,7 @@ class OrbixScheduler(coroOnlyScheduler):
                         result="threshold_failure",
                     )
 
-            return None, None, max_pdet, None
+            return None, None, max_pdet, None, None
 
         pdet = _pdet.copy()
         pdet[pdet < threshold] = 0
@@ -1271,7 +1323,7 @@ class OrbixScheduler(coroOnlyScheduler):
 
             if np.all(pdet_wo_sched == 0):
                 # No valid windows found even without overlaps
-                return None, None, max_pdet, None
+                return None, None, max_pdet, None, None
 
             # Pick the highest pdet/intTime window
             pdet_div_int = pdet_wo_sched / _int_times
@@ -1279,6 +1331,12 @@ class OrbixScheduler(coroOnlyScheduler):
             cand_start = cand_starts[row, col]
             cand_end = cand_ends[row, col]
             pdet_val = pdet_wo_sched[row, col]
+
+            # Calculate predicted values at the selected time
+            selected_time_norm = prop_times[row]
+            predicted_values = self._calculate_predicted_values(
+                track, selected_time_norm, fZ[row], mode
+            )
 
             # Is everyone we collide with lower priority?
             ok = self._bump_lower_priority_blocks(cand_start, cand_end, track)
@@ -1306,7 +1364,7 @@ class OrbixScheduler(coroOnlyScheduler):
                             selected_int=_int_times[col],
                         )
 
-                return cand_start, _int_times[col], max_pdet, pdet_val
+                return cand_start, _int_times[col], max_pdet, pdet_val, predicted_values
 
             # still no luck
             if is_char:
@@ -1328,7 +1386,7 @@ class OrbixScheduler(coroOnlyScheduler):
                         selected_int=_int_times[col],
                     )
 
-            return None, None, max_pdet, None
+            return None, None, max_pdet, None, None
 
         pdet_div_int_time = pdet / _int_times
 
@@ -1344,6 +1402,13 @@ class OrbixScheduler(coroOnlyScheduler):
         t_start = prop_times[row] + TK.missionStart.mjd
         int_time = _int_times[col]
         pdet_val = pdet_div_int_time[row, col] * int_time
+
+        # Calculate predicted values at the selected time
+        selected_time_norm = prop_times[row]
+        predicted_values = self._calculate_predicted_values(
+            track, selected_time_norm, fZ[row], mode
+        )
+
         if is_char:
             # Create debug plot for successful scheduling
             if hasattr(self, "debug_plots") and self.debug_plots:
@@ -1363,7 +1428,61 @@ class OrbixScheduler(coroOnlyScheduler):
                     selected_int=int_time,
                 )
 
-        return t_start, int_time, max_pdet, pdet_val
+        return t_start, int_time, max_pdet, pdet_val, predicted_values
+
+    def _calculate_predicted_values(self, track, time_norm, fZ_val, mode):
+        """
+        Calculate predicted observation values at a given time for debugging.
+
+        Args:
+            track (PlanetTrack): The planet track
+            time_norm (float): Time in mission-elapsed days
+            fZ_val (float): Zodiacal light brightness at this time
+            mode (dict): Observation mode
+
+        Returns:
+            dict: Dictionary with predicted fZ, WA, d, and dMag values
+        """
+        planets = self.SimulatedUniverse.orbix_planets[track.pInd]
+
+        # Get predicted orbital position and separation/magnitude
+        jax_time = jnp.array([time_norm])
+
+        # Get position in AU
+        pos_AU = planets.j_prop_AU(self.solver, jax_time)  # Shape: (n_orbits, 3)
+
+        # Get alpha (separation) and dMag
+        alphas, dMags = planets.j_alpha_dMag(self.solver, jax_time)
+        alphas_rad = (alphas * u.arcsec).to_value(u.rad)
+
+        # Calculate distance (magnitude of position vector)
+        distances_AU = jnp.sqrt(jnp.sum(pos_AU**2, axis=1))
+
+        # Take the median values across all orbit realizations for the prediction
+        predicted_WA = float(jnp.median(alphas))  # arcsec
+        predicted_d = float(jnp.median(distances_AU))  # AU
+        predicted_separation = float(
+            jnp.median(alphas_rad) * self.TargetList.dist[track.sInd].to_value(u.AU)
+        )  # AU
+        predicted_dMag = float(jnp.median(dMags))
+        predicted_fZ = float(fZ_val)  # Already a scalar
+
+        # Calculate predicted JEZ using the same method as actual observations
+        # Get the base JEZ for this star and mode
+        JEZ0 = self.TargetList.JEZ0[mode["hex"]][track.sInd]
+
+        # Apply the 1/r^2 scaling using predicted orbital distance
+        # This matches how SimulatedUniverse.scale_JEZ works
+        predicted_JEZ = 3 * JEZ0 * (1 / predicted_separation) ** 2
+
+        return {
+            "predicted_fZ": predicted_fZ,
+            "predicted_WA": predicted_WA,
+            "predicted_d": predicted_d,
+            "predicted_dMag": predicted_dMag,
+            "predicted_JEZ": predicted_JEZ,
+            "time_norm": float(time_norm),
+        }
 
     def _bump_lower_priority_blocks(self, start: float, end: float, track: PlanetTrack):
         """
@@ -1432,6 +1551,16 @@ class OrbixScheduler(coroOnlyScheduler):
         self.retired_tracks[key] = track
         del self.planet_tracks[key]
         self.ignore_stars.append(track.sInd)
+
+        # Clean up retry tracking
+        if key in self.track_retry_counts:
+            del self.track_retry_counts[key]
+
+        # Remove from any requeue_later lists
+        for stage_list in self.to_requeue_later.values():
+            if track in stage_list:
+                stage_list.remove(track)
+
         for action in self.schedule:
             # Check the schedule and remove any lingering actions
             if action.target.sInd == track.sInd and action.target.pInd == track.pInd:
@@ -1567,14 +1696,6 @@ class OrbixScheduler(coroOnlyScheduler):
         intTimes = Comp.best_intTime[sInds] << u.d
         return intTimes
 
-    def _available_obs_time(self, ref=None):
-        TK = self.TimeKeeping
-        spent = TK.exoplanetObsTime.to_value(u.day)
-        held = sum(
-            bl.duration for bl in self.schedule if (ref is None) or (bl.start >= ref)
-        )
-        return TK.allocated_time_d - spent - held
-
     def _available_obs_time(self, ref=None, mode=None):
         """
         Calculates the available exoplanet observation time, accounting for
@@ -1629,12 +1750,12 @@ class OrbixScheduler(coroOnlyScheduler):
         # Ensure dMag0s is initialized and contains the mode and sInd
         dMag0Grid_for_star = self.dMag0s[mode["hex"]][sInd]
         if dMag0Grid_for_star.int_times.size > 0:
-            return float(dMag0Grid_for_star.int_times[-1]) / 2
+            return float(dMag0Grid_for_star.int_times[-1])
 
     def _calculate_total_reserved_time_for_tracks(self):
         """
         Estimates the total future observation time (integration + overheads)
-        committed to all active PlanetTracks.
+        committed to all active PlanetTracks, excluding deferred tracks.
         Returns total reserved time in days.
         """
         total_reserved_time_d = 0.0
@@ -1647,15 +1768,29 @@ class OrbixScheduler(coroOnlyScheduler):
             self.base_char_mode["syst"]["ohTime"] + self.Observatory.settlingTime
         ).to_value(u.d)
 
+        # Get set of deferred track keys to exclude from reservation
+        deferred_track_keys = set()
+        for stage_tracks in self.to_requeue_later.values():
+            for track in stage_tracks:
+                deferred_track_keys.add((track.sInd, track.pInd))
+
         for track in self.planet_tracks.values():
+            key = (track.sInd, track.pInd)
+
+            # Skip deferred tracks - they shouldn't reserve time since they can't be scheduled
+            if key in deferred_track_keys:
+                continue
+
             sInd = track.sInd
 
             # Get pessimistic (maximum) integration time estimates for this track's star
-            est_max_int_time_det_d = self._get_estimated_max_int_time_for_mode(
-                self.base_det_mode, sInd
+            est_max_int_time_det_d = (
+                self._get_estimated_max_int_time_for_mode(self.base_det_mode, sInd)
+                * 0.25
             )
-            est_max_int_time_char_d = self._get_estimated_max_int_time_for_mode(
-                self.base_char_mode, sInd
+            est_max_int_time_char_d = (
+                self._get_estimated_max_int_time_for_mode(self.base_char_mode, sInd)
+                * 0.25
             )
 
             remaining_detections_needed = 0
@@ -2007,6 +2142,7 @@ class OrbixScheduler(coroOnlyScheduler):
         Comp = self.Completeness
         # For stars with ensembles we need to get the completeness at the current time
         ens_inds = []
+        unavilable_ens_inds = []
         ens_best_comp_div_intTime = []
         ens_best_intTime = []
         _revisit_best_comp_div_intTime = 0
@@ -2019,6 +2155,7 @@ class OrbixScheduler(coroOnlyScheduler):
                 if TK.currentTimeNorm.to_value(u.day) < ens.next_available_time:
                     # Star isn't near it's maximum dynamic completeness so we can
                     # ignore it
+                    unavilable_ens_inds.append(sInd)
                     continue
                 ens_inds.append(sInd)
                 t_ind = (
@@ -2041,7 +2178,10 @@ class OrbixScheduler(coroOnlyScheduler):
         # For stars with no observations yet, choose the one with the highest
         # completeness/intTime
         _blind_sInds = np.setdiff1d(sInds, ens_inds)
+        _blind_sInds = np.setdiff1d(_blind_sInds, unavilable_ens_inds)
         best_blind_comp_div_intTime = 0
+        _blind_sInd = None
+
         if len(_blind_sInds) > 0:
             _blind_comp_div_intTime = Comp.best_comp_div_intTime[_blind_sInds]
             # _ind is the index of the star with the highest completeness/intTime
@@ -2061,7 +2201,7 @@ class OrbixScheduler(coroOnlyScheduler):
                 * _revisit_best_intTime
             )
             comp_d_t = _revisit_best_comp_div_intTime
-        else:
+        elif _blind_sInd is not None:
             sInd = _blind_sInd
             _ind = np.where(sInds == sInd)[0][0]
             int_time = intTimes[_ind]
@@ -2071,6 +2211,10 @@ class OrbixScheduler(coroOnlyScheduler):
                 * int_time.to_value(u.day)
             )
             comp_d_t = best_blind_comp_div_intTime
+        else:
+            # No valid targets available
+            return None, None, None, 0, 0
+
         # Get the slew time
         slew_time = slewTimes[_ind]
 
@@ -2121,17 +2265,6 @@ class OrbixScheduler(coroOnlyScheduler):
         currentTimeNorm = TK.currentTimeNorm.copy()
         currentTimeAbs = TK.currentTimeAbs.copy()
 
-        # Allocate Time
-        extraTime = intTime * (mode["timeMultiplier"] - 1.0)  # calculates extraTime
-        success = TK.allocate_time(
-            intTime + extraTime + Obs.settlingTime + mode["syst"]["ohTime"], True
-        )
-        if not success:
-            breakpoint()
-        assert success, "Could not allocate observation detection time ({}).".format(
-            intTime + extraTime + Obs.settlingTime + mode["syst"]["ohTime"]
-        )
-        # calculates partial time to be added for every ntFlux
         dt = intTime / float(self.ntFlux)
         # find indices of planets around the target
         pInds = np.where(SU.plan2star == sInd)[0]
@@ -2528,26 +2661,6 @@ class OrbixScheduler(coroOnlyScheduler):
 
         return characterized.astype(int), fZ, JEZ, systemParams, SNR, intTime
 
-    def char_revisit_filter(self, char_sInds, _epoch):
-        """Filter out stars that aren't ready for revisit yet."""
-        char_tovisit = np.zeros(self.TargetList.nStars, dtype=bool)
-
-        # Only consider stars that haven't exceeded visit limit
-        char_tovisit[char_sInds] = self.char_starVisits[char_sInds] < self.nVisitsMax
-
-        # Filter out stars that aren't ready for revisit yet
-        if self.char_starRevisit.size != 0:
-            # char_starRevisit's second column is the time when the star
-            # should be revisited and we don't want them in the
-            # char_tovisit list if currentTimeNorm < revisit time
-            is_too_early = _epoch.now_norm < self.char_starRevisit[:, 1]
-            # Get stars with where the revisit time hasn't been reached
-            too_early_stars = self.char_starRevisit[is_too_early, 0].astype(int)
-            # Remove these from consideration
-            char_tovisit[too_early_stars] = False
-
-        return np.where(char_tovisit)[0]
-
     def select_default_observing_modes(self):
         """
         Identify default detection and characterization observing modes.
@@ -2573,20 +2686,33 @@ class OrbixScheduler(coroOnlyScheduler):
 
     def do_detection(self, action):
         """Tasks related to a detection observation"""
-        SU, TL, TK, Comp = (
+        SU, TL, TK, Comp, Obs = (
             self.SimulatedUniverse,
             self.TargetList,
             self.TimeKeeping,
             self.Completeness,
+            self.Observatory,
         )
         _meta = self._build_meta(action)
         _drm_entry = {}
+        # Allocate Time
+        _int_time = action.int_time.copy() << u.d
+        extraTime = _int_time * (action.mode["timeMultiplier"] - 1.0)
+        # calculates extraTime
+        success = TK.allocate_time(
+            _int_time + extraTime + Obs.settlingTime + action.mode["syst"]["ohTime"],
+            True,
+        )
+        if not success:
+            self.logger.warning(
+                f"Could not allocate observation detection time ({_int_time + extraTime + Obs.settlingTime + action.mode['syst']['ohTime']})."
+            )
+            return False
 
         # update visited list for selected star
         self.starVisits[action.target.sInd] += 1
         self.det_starVisits[action.target.sInd] += 1
         # PERFORM DETECTION
-        _int_time = action.int_time.copy() << u.d
         detected, det_fZ, det_JEZ, det_systemParams, det_SNR, FA = (
             self.observation_detection(action.target.sInd, _int_time, action.mode)
         )
@@ -2674,6 +2800,7 @@ class OrbixScheduler(coroOnlyScheduler):
             # WAS ... = char_SNR[:-1] if FA else char_SNR
             char_data["char_SNR"] = char_SNR
             char_data["char_fZ"] = char_fZ.to(self.fZ_unit)
+            char_data["char_JEZ"] = char_JEZ.to(self.JEZ_unit)
             char_data["char_params"] = char_systemParams
 
             if char_intTime is not None and np.any(characterized):
@@ -2864,7 +2991,7 @@ class OrbixScheduler(coroOnlyScheduler):
             "\n══════════════ MISSION TRACKER ══════════════",
             f"Unique stars: {stats['total_stars_visited']} | "
             + f"Planets: {stats['detected_planets']} detected | Comp: {stats['comp']:.2f}",
-            f"Active planet tracks: {stats['active_planets']} | {stats['future_scheduled_observations']} scheduled",
+            f"Active planet tracks: {stats['active_planets']} | {stats['future_scheduled_observations']} scheduled | {stats['deferred_tracks']} deferred",
             # Total number of blind observations | Number of scheduled observations carried out
             f"Observations: {stats['blind_observations']} blind | {stats['past_scheduled_observations']} scheduled",
         ]
@@ -2889,8 +3016,11 @@ class OrbixScheduler(coroOnlyScheduler):
 
         # Then add all characterization stages
         for stage in range(1, self.required_char_successes + 1):
-            count = stats["characterization_stages"].get(stage, 0)
             stage_diff = char_changes.get(stage, 0)
+            if stage == self.required_char_successes:
+                count = stats["chars_completed"]
+            else:
+                count = stats["characterization_stages"].get(stage, 0)
 
             # Format the stage count with highlighting if it changed
             if stage_diff > 0:
@@ -2951,6 +3081,14 @@ class OrbixScheduler(coroOnlyScheduler):
         used_time = total_time - available_time
         percent_used = (used_time / total_time) * 100 if total_time > 0 else 0
 
+        # Calculate deferred tracks stats
+        total_deferred_tracks = sum(
+            len(tracks) for tracks in self.to_requeue_later.values()
+        )
+        deferred_by_stage = {
+            stage: len(tracks) for stage, tracks in self.to_requeue_later.items()
+        }
+
         # Initialize stats dictionary
         stats = {
             "total_planets": SU.nPlans,
@@ -2978,6 +3116,8 @@ class OrbixScheduler(coroOnlyScheduler):
             "total_time": total_time,
             "used_time": used_time,
             "percent_used": percent_used,
+            "deferred_tracks": total_deferred_tracks,
+            "deferred_by_stage": deferred_by_stage,
         }
 
         # Count planets at each detection and characterization stage
@@ -3564,3 +3704,340 @@ class OrbixScheduler(coroOnlyScheduler):
         self.logger.info(f"Saved scheduling attempt plot to {filename}")
 
         return filename
+
+    def calc_mission_stats(self):
+        """
+        Calculate mission statistics using PlanetTrack objects.
+        Maintains the same format as the reduce_DRM function from driver.py.
+        """
+        # Get planet classifications
+        self.subtypes, self.is_earth = self.classify_planets()
+
+        # Initialize counters for each statistic
+        dets = Counter()
+        chars = Counter()
+        det_subtypes = Counter()
+        det_earths = Counter()
+        char_subtypes = Counter()
+        char_earths = Counter()
+
+        # Process active planet tracks
+        for key, track in self.planet_tracks.items():
+            sInd, pInd = key
+
+            # Count detections (planets detected at least once)
+            if track.det_successes > 0:
+                dets[pInd] += track.det_successes
+                det_subtypes[self.subtypes[pInd]] += 1
+                if self.is_earth[pInd]:
+                    det_earths[pInd] += track.det_successes
+
+            # Count characterizations (planets that completed characterization)
+            if track.char_successes >= self.required_char_successes:
+                chars[pInd] += 1
+                char_subtypes[self.subtypes[pInd]] += 1
+                if self.is_earth[pInd]:
+                    char_earths[pInd] += 1
+
+        # Process retired planet tracks
+        for key, track in self.retired_tracks.items():
+            sInd, pInd = key
+
+            # Count detections
+            if track.det_successes > 0:
+                dets[pInd] += track.det_successes
+                det_subtypes[self.subtypes[pInd]] += 1
+                if self.is_earth[pInd]:
+                    det_earths[pInd] += track.det_successes
+
+            # Count characterizations
+            if track.char_successes >= self.required_char_successes:
+                chars[pInd] += track.char_successes
+                char_subtypes[self.subtypes[pInd]] += 1
+                if self.is_earth[pInd]:
+                    char_earths[pInd] += track.char_successes
+
+        # Store results in the same format as reduce_DRM
+        self.mission_stats = {
+            "dets": dict(dets),
+            "chars": dict(chars),
+            "det_subtypes": dict(det_subtypes),
+            "det_earths": dict(det_earths),
+            "char_subtypes": dict(char_subtypes),
+            "char_earths": dict(char_earths),
+        }
+
+    def classify_planets(self):
+        """
+        This determines the Kopparapu bin of the planet This is adapted from
+        the EXOSIMS SubtypeCompleteness method classifyPlanets so that EXOSIMS
+        isn't a mandatory import
+        """
+
+        TL = self.TargetList
+        SU = self.SimulatedUniverse
+        plan2star = SU.plan2star
+        Rp = SU.Rp.to_value(u.earthRad)
+        a = SU.a.to_value(u.AU)
+        e = SU.e
+
+        # Calculate the luminosity of the star, assuming main-sequence
+        star_lum = TL.L[plan2star] * u.Lsun
+
+        # Find the stellar flux at the planet's location as a fraction of earth's
+        earth_Lp = const.L_sun / (1 * (1 + (0.0167**2) / 2)) ** 2
+        Lp = (star_lum / (a * (1 + (e**2) / 2)) ** 2 / earth_Lp).decompose().value
+
+        # Find Planet Rp range
+        Rp_bins = np.array([0.5, 1.0, 1.75, 3.5, 6.0, 14.3])
+        all_Rp_types = np.array(
+            [
+                "Rocky",
+                "Super-Earth",
+                "Sub-Neptune",
+                "Sub-Jovian",
+                "Jovian",
+            ]
+        )
+        L_bins = np.array(
+            [
+                [182, 1.0, 0.28, 0.0035],
+                [187, 1.12, 0.30, 0.0030],
+                [188, 1.15, 0.32, 0.0030],
+                [220, 1.65, 0.45, 0.0030],
+                [220, 1.65, 0.40, 0.0025],
+            ]
+        )
+        # Find the bin of the radius
+        Rp_bin = np.digitize(Rp, Rp_bins) - 1
+        Rp_bin = np.clip(Rp_bin, 0, len(all_Rp_types) - 1)
+        Rp_types = all_Rp_types[Rp_bin]
+        # TODO Fix this to give correct when at edge cases since technically
+        # they're not straight lines
+
+        # # index of planet temp. cold,warm,hot
+        all_L_types = np.array(["Hot", "Warm", "Cold"])
+        specific_L_bins = L_bins[Rp_bin, :]
+        L_bin = np.zeros(len(Lp))
+        for i in range(len(Lp)):
+            L_bin[i] = np.digitize(Lp[i], specific_L_bins[i]) - 1
+        L_bin = np.clip(L_bin, 0, len(all_L_types) - 1).astype(int)
+        L_types = all_L_types[L_bin]
+        subtypes = [f"{L_type} {Rp_type}" for L_type, Rp_type in zip(L_types, Rp_types)]
+
+        # Determine if the planet is Earth-like
+        # Reverse luminosity scaling
+        scaled_a = a / np.sqrt(star_lum.to(u.Lsun).value)
+
+        lower_a = 0.95
+        upper_a = 1.67
+
+        lower_R = 0.8 / np.sqrt(scaled_a)
+        upper_R = 1.4
+        earth_a_cond = (lower_a <= scaled_a) & (scaled_a < upper_a)
+        earth_Rp_cond = (lower_R <= Rp) & (Rp < upper_R)
+
+        is_earth = earth_a_cond & earth_Rp_cond
+        return subtypes, is_earth
+
+    def _queue_for_later_retry(self, track):
+        """
+        Queue a track for later retry instead of immediately retiring it.
+        Tracks are organized by stage (priority level) and have a maximum retry count.
+
+        Args:
+            track (PlanetTrack): The track that couldn't be scheduled
+        """
+        key = (track.sInd, track.pInd)
+        retry_count = self.track_retry_counts.get(key, 0)
+
+        if retry_count < self.max_requeue_attempts:
+            # Add to requeue_later organized by stage (priority)
+            if track.stage not in self.to_requeue_later:
+                self.to_requeue_later[track.stage] = []
+
+            self.to_requeue_later[track.stage].append(track)
+            self.track_retry_counts[key] = retry_count + 1
+
+            self.logger.info(
+                f"REQUEUE: Queueing track ({track.sInd},{track.pInd}) for later retry "
+                f"(attempt {retry_count + 1}/{self.max_requeue_attempts}), stage {track.stage}"
+            )
+        else:
+            # Exceeded max retries, retire the track
+            self._retire_track(track)
+            self.logger.info(
+                f"REQUEUE: Retiring track ({track.sInd},{track.pInd}) after "
+                f"{self.max_requeue_attempts} failed scheduling attempts"
+            )
+
+    def _process_requeue_later(self, completed_track_stage):
+        """
+        Process tracks queued for later retry after an observation completes.
+        Retries tracks at the same or lower priority level than the completed observation.
+
+        Args:
+            completed_track_stage (int): The stage of the track that just completed an observation
+        """
+        if not self.to_requeue_later:
+            return
+
+        tracks_to_retry = []
+
+        # Collect tracks at same or lower priority level for retry
+        for stage in list(self.to_requeue_later.keys()):
+            if stage <= completed_track_stage:
+                stage_tracks = self.to_requeue_later.pop(stage, [])
+                tracks_to_retry.extend(stage_tracks)
+
+        if tracks_to_retry:
+            self.logger.info(
+                f"REQUEUE: Processing {len(tracks_to_retry)} tracks for retry "
+                f"after stage {completed_track_stage} observation"
+            )
+
+        # Try to schedule each track again
+        for track in tracks_to_retry:
+            key = (track.sInd, track.pInd)
+
+            # Verify track is still valid (not retired)
+            if key in self.planet_tracks:
+                # Create a dummy previous action for _queue_followup
+                # This is needed because _queue_followup expects a previous action
+                dummy_action = ScheduleAction(
+                    start=self.TimeKeeping.currentTimeAbs.mjd,
+                    duration=0.1,  # Minimal duration
+                    purpose="detection"
+                    if track.char_successes == 0
+                    else "characterization",
+                    target=Target.planet(track.sInd, track.pInd),
+                    mode=self.base_det_mode
+                    if track.char_successes == 0
+                    else self.base_char_mode,
+                    int_time=0.1,
+                    blind=False,
+                )
+
+                try:
+                    self._queue_followup(track, dummy_action)
+                    self.logger.info(
+                        f"REQUEUE: Successfully rescheduled track ({track.sInd},{track.pInd})"
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"REQUEUE: Failed to reschedule track ({track.sInd},{track.pInd}): {e}"
+                    )
+                    # If rescheduling fails, queue it for another retry unless we've hit max attempts
+                    self._queue_for_later_retry(track)
+            else:
+                self.logger.info(
+                    f"REQUEUE: Track ({track.sInd},{track.pInd}) no longer active, skipping"
+                )
+
+    def _tracks_for_star(self, sInd: int):
+        """Iterator over all PlanetTracks belonging to one star."""
+        return (t for t in self.planet_tracks.values() if t.sInd == sInd)
+
+    def get_deferred_retry_status(self):
+        """
+        Get detailed status of the deferred retry system for debugging.
+
+        Returns:
+            dict: Detailed information about deferred tracks and retry counts
+        """
+        status = {
+            "total_deferred": sum(
+                len(tracks) for tracks in self.to_requeue_later.values()
+            ),
+            "by_stage": {},
+            "retry_counts": dict(self.track_retry_counts),
+            "max_attempts": self.max_requeue_attempts,
+        }
+
+        for stage, tracks in self.to_requeue_later.items():
+            status["by_stage"][stage] = {
+                "count": len(tracks),
+                "tracks": [(t.sInd, t.pInd) for t in tracks],
+            }
+
+        return status
+
+    def log_deferred_retry_status(self):
+        """Log the current status of deferred retries."""
+        status = self.get_deferred_retry_status()
+
+        if status["total_deferred"] == 0:
+            self.logger.info("REQUEUE STATUS: No tracks currently deferred")
+            return
+
+        self.logger.info(
+            f"REQUEUE STATUS: {status['total_deferred']} tracks deferred for retry"
+        )
+
+        for stage, info in status["by_stage"].items():
+            track_list = ", ".join([f"({s},{p})" for s, p in info["tracks"]])
+            self.logger.info(f"  Stage {stage}: {info['count']} tracks - {track_list}")
+
+    def force_retry_all_deferred(self):
+        """
+        Force retry of all deferred tracks regardless of priority.
+        Useful for debugging and testing.
+        """
+        if not self.to_requeue_later:
+            self.logger.info("REQUEUE FORCE: No deferred tracks to retry")
+            return
+
+        total_tracks = sum(len(tracks) for tracks in self.to_requeue_later.values())
+        self.logger.info(
+            f"REQUEUE FORCE: Forcing retry of {total_tracks} deferred tracks"
+        )
+
+        # Process all stages
+        max_stage = max(self.to_requeue_later.keys()) if self.to_requeue_later else 0
+        self._process_requeue_later(max_stage)
+
+    def _available_obs_time(self, ref=None, mode=None):
+        """
+        Calculates the available exoplanet observation time, accounting for
+        spent time, currently scheduled (held) time, and future reserved time for active tracks.
+        Returns available time in days.
+        """
+        TK = self.TimeKeeping
+
+        # Time already spent on exoplanet science observations
+        spent_exoplanet_time_d = TK.exoplanetObsTime.to_value(u.d)
+        if mode is None:
+            mode = self.base_det_mode
+
+        obs_oh_time = (mode["syst"]["ohTime"] + self.Observatory.settlingTime).to_value(
+            u.d
+        )
+
+        # Time for observations already in self.schedule (future commitments)
+        # act.duration should already be in days and include overheads
+        scheduled_held_d = sum(
+            act.duration
+            for act in self.schedule
+            if (ref is None)
+            or (
+                act.start
+                >= (ref if isinstance(ref, (float, int)) else ref.to_value(u.d))
+            )
+        )
+
+        # Newly calculated reserved time for future needs of all active PlanetTracks
+        future_tracks_reserved_d = self._calculate_total_reserved_time_for_tracks()
+
+        # Total time allocated for exoplanet science in the mission
+        total_allocated_exoplanet_time_d = TK.allocated_time_d
+
+        # Net available time for new initiatives (e.g., blind searches)
+        net_available_d = (
+            total_allocated_exoplanet_time_d
+            - spent_exoplanet_time_d
+            - scheduled_held_d
+            - future_tracks_reserved_d
+            - obs_oh_time
+        )
+
+        return max(0.0, net_available_d)
