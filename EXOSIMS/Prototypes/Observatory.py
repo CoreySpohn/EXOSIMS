@@ -10,6 +10,7 @@ import astropy.constants as const
 import astropy.units as u
 import numpy as np
 from astropy.time import Time
+from intervaltree import IntervalTree
 from scipy.interpolate import CubicSpline
 from tqdm import tqdm
 
@@ -683,9 +684,7 @@ class Observatory(object):
         f = self.orbital_frequency  # orbital frequency (2*pi/sideral day)
         r = self.orbital_height  # orbital height in AU
         I = self.orbital_inclination  # noqa: E741  # orbital inclination in degrees
-        O = (
-            self.orbital_right_ascension
-        )  # noqa: E741  # right ascension of the ascending node
+        O = self.orbital_right_ascension  # noqa: E741  # right ascension of the ascending node
 
         # observatory positions vector wrt Earth in orbital plane
         _ft = f * t
@@ -958,6 +957,73 @@ class Observatory(object):
             self.vprint("Keepout Map array stored in %r" % koPath)
 
         return koMap, koTimes
+
+    def generate_ko_intervals(self, TL, koMaps, koTimes_mjd, mission_finish_mjd):
+        star_keepout_trees = {}
+        for mode_name, current_koMap_for_mode in koMaps.items():
+            # current_koMap_for_mode is (nStars, nTimes), True == observable
+            mode_specific_trees = [IntervalTree() for _ in range(TL.nStars)]
+            star_keepout_trees[mode_name] = mode_specific_trees
+
+            if not koTimes_mjd.size > 0:
+                continue
+
+            for sInd in range(TL.nStars):
+                sInd_tree = mode_specific_trees[sInd]
+
+                t_idx = 0
+                n_times = koTimes_mjd.size
+
+                while t_idx < n_times:
+                    is_observable_current_bin = current_koMap_for_mode[sInd, t_idx]
+
+                    if (
+                        not is_observable_current_bin
+                    ):  # Found the start of a keepout block
+                        block_start_mjd = koTimes_mjd[t_idx]
+
+                        # Find the end of this contiguous keepout block
+                        # The current t_idx is the first bin in the block.
+                        block_last_t_idx_in_sequence = t_idx
+
+                        # Look ahead to find how far this keepout sequence extends
+                        while (
+                            block_last_t_idx_in_sequence + 1 < n_times
+                            and not current_koMap_for_mode[
+                                sInd, block_last_t_idx_in_sequence + 1
+                            ]
+                        ):
+                            block_last_t_idx_in_sequence += 1
+
+                        # The keepout block includes bins from t_idx to block_last_t_idx_in_sequence.
+                        # The MJD end of this entire block is the end of the *last bin* in the sequence.
+                        # The last bin in the sequence starts at koTimes_mjd[block_last_t_idx_in_sequence]
+                        # and ends at koTimes_mjd[block_last_t_idx_in_sequence] + ko_dt_step_val.
+                        block_end_mjd = (
+                            koTimes_mjd[block_last_t_idx_in_sequence]
+                            + self.ko_dtStep.value
+                        )
+
+                        # Ensure the interval does not exceed mission finish time
+                        block_end_mjd = min(block_end_mjd, mission_finish_mjd)
+
+                        if (
+                            block_end_mjd > block_start_mjd
+                        ):  # Add only if valid duration
+                            sInd_tree.addi(block_start_mjd, block_end_mjd, "keepout")
+
+                        # Advance t_idx to the position *after* the processed block
+                        t_idx = block_last_t_idx_in_sequence + 1
+                    else:  # Observable, so just move to the next time step
+                        t_idx += 1
+
+                # Although the loop above creates merged intervals,
+                # calling merge_overlaps() is a good safeguard against any potential
+                # floating-point issues or edge cases that might leave tiny gaps/overlaps.
+                # It should be very fast if intervals are already mostly merged.
+                if len(sInd_tree) > 0:  # Only call if there are intervals
+                    sInd_tree.merge_overlaps()
+        return star_keepout_trees
 
     def calculate_observableTimes(self, TL, sInds, currentTime, koMaps, koTimes, mode):
         """Returns the next window of time during which targets are observable
