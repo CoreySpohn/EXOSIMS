@@ -36,7 +36,7 @@ class DulzPlavchanUniverseEarthsOnly(SimulatedUniverse):
             (a < 1.67 * u.AU)
             & (a > 0.95 * u.AU)
             & (Rp < 1.4 * u.R_earth)
-            & (Rp > 0.8 / np.sqrt(a.value) * u.R_earth)
+            & (Rp > 0.8 / np.sqrt(a.to_value(u.AU)) * u.R_earth)
         )
 
         self.a = a[inds]
@@ -71,7 +71,9 @@ class DulzPlavchanUniverseEarthsOnly(SimulatedUniverse):
         else:
             self.phiIndex = np.asarray([])
         ZL = self.ZodiacalLight
-        if self.commonSystemnEZ:
+        if self.fixed_nEZ_val is not None:
+            self.nEZ = np.ones((self.nPlans,)) * self.fixed_nEZ_val
+        elif self.commonSystemnEZ:
             # Assign the same nEZ to all planets in the system
             self.nEZ = ZL.gen_systemnEZ(TL.nStars)[self.plan2star]
         else:
