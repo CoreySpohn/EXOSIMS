@@ -971,11 +971,18 @@ class OpticalSystem(object):
             # when provided, always use deltaLam instead of BW (bandwidth fraction)
             syst_lam = mode["syst"]["lam"].to("nm").value
             syst_BW = mode["syst"]["BW"]
-            mode["lam"] = float(mode.get("lam", syst_lam)) * u.nm
-            mode["deltaLam"] = (
-                float(mode.get("deltaLam", mode["lam"].value * mode.get("BW", syst_BW)))
-                * u.nm
+            # Handle case where mode["lam"] might already be a Quantity from a previous run
+            lam_val = mode.get("lam", syst_lam)
+            if isinstance(lam_val, u.Quantity):
+                lam_val = lam_val.to("nm").value
+            mode["lam"] = float(lam_val) * u.nm
+            # Handle case where mode["deltaLam"] might already be a Quantity
+            deltaLam_val = mode.get(
+                "deltaLam", mode["lam"].value * mode.get("BW", syst_BW)
             )
+            if isinstance(deltaLam_val, u.Quantity):
+                deltaLam_val = deltaLam_val.to("nm").value
+            mode["deltaLam"] = float(deltaLam_val) * u.nm
             mode["BW"] = float(mode["deltaLam"] / mode["lam"])
 
             # get mode IWA and OWA: rescale if the mode wavelength is different from
@@ -1207,7 +1214,13 @@ class OpticalSystem(object):
                     minl = syst["lam"] - syst["deltaLam"] / 2
                     maxl = syst["lam"] + syst["deltaLam"] / 2
                     syst[param_name] = (
-                        lambda lam, s, d=0 * u.arcsec, Dinterp=Dinterp, minl=minl, maxl=maxl, fill=fill: (  # noqa: E501
+                        lambda lam,
+                        s,
+                        d=0 * u.arcsec,
+                        Dinterp=Dinterp,
+                        minl=minl,
+                        maxl=maxl,
+                        fill=fill: (  # noqa: E501
                             np.array(Dinterp(s.to("arcsec").value), ndmin=1) - fill
                         )
                         * np.array((minl < lam) & (lam < maxl), ndmin=1).astype(int)
@@ -1215,9 +1228,11 @@ class OpticalSystem(object):
                     )
                 else:
                     syst[param_name] = (
-                        lambda lam, s, d=0 * u.arcsec, Dinterp=Dinterp, lam0=syst[
-                            "lam"
-                        ]: np.array(
+                        lambda lam,
+                        s,
+                        d=0 * u.arcsec,
+                        Dinterp=Dinterp,
+                        lam0=syst["lam"]: np.array(
                             Dinterp((s * lam0 / lam).to("arcsec").value), ndmin=1
                         )
                     )
@@ -1260,7 +1275,13 @@ class OpticalSystem(object):
                     minl = syst["lam"] - syst["deltaLam"] / 2
                     maxl = syst["lam"] + syst["deltaLam"] / 2
                     syst[param_name] = (
-                        lambda lam, s, d=0 * u.arcsec, Dinterp=Dinterp, minl=minl, maxl=maxl, fill=fill: (  # noqa: E501
+                        lambda lam,
+                        s,
+                        d=0 * u.arcsec,
+                        Dinterp=Dinterp,
+                        minl=minl,
+                        maxl=maxl,
+                        fill=fill: (  # noqa: E501
                             np.array(
                                 Dinterp((s.to("arcsec").value, d.to("arcsec").value)),
                                 ndmin=1,
@@ -1306,7 +1327,15 @@ class OpticalSystem(object):
                 maxl = syst["lam"] + syst["deltaLam"] / 2
 
                 syst[param_name] = (
-                    lambda lam, s, d=0 * u.arcsec, D=D, IWA=IWA, OWA=OWA, minl=minl, maxl=maxl, fill=fill: (  # noqa: E501
+                    lambda lam,
+                    s,
+                    d=0 * u.arcsec,
+                    D=D,
+                    IWA=IWA,
+                    OWA=OWA,
+                    minl=minl,
+                    maxl=maxl,
+                    fill=fill: (  # noqa: E501
                         np.array(
                             (IWA <= s.to("arcsec").value)
                             & (s.to("arcsec").value <= OWA)
@@ -1321,9 +1350,14 @@ class OpticalSystem(object):
 
             else:
                 syst[param_name] = (
-                    lambda lam, s, d=0 * u.arcsec, D=D, lam0=syst[
-                        "lam"
-                    ], IWA=IWA, OWA=OWA, fill=fill: (
+                    lambda lam,
+                    s,
+                    d=0 * u.arcsec,
+                    D=D,
+                    lam0=syst["lam"],
+                    IWA=IWA,
+                    OWA=OWA,
+                    fill=fill: (
                         np.array(
                             (IWA <= (s * lam0 / lam).to("arcsec").value)
                             & ((s * lam0 / lam).to("arcsec").value <= OWA),
@@ -1641,7 +1675,14 @@ class OpticalSystem(object):
                     outunit = 1
 
                 syst[param_name] = (
-                    lambda lam, s, D=D, IWA=IWA, OWA=OWA, minl=minl, maxl=maxl, fill=fill: (  # noqa: E501
+                    lambda lam,
+                    s,
+                    D=D,
+                    IWA=IWA,
+                    OWA=OWA,
+                    minl=minl,
+                    maxl=maxl,
+                    fill=fill: (  # noqa: E501
                         (
                             np.array(
                                 (IWA <= s.to_value("arcsec"))

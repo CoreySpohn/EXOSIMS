@@ -107,7 +107,6 @@ class PlanetPopulation(object):
         cachedir=None,
         **specs,
     ):
-
         # start the outspec
         self._outspec = {}
 
@@ -141,6 +140,9 @@ class PlanetPopulation(object):
         ), "eta must be strictly positive"
         # global occurrence rate defined as expected number of planets per
         # star in a given universe
+        # Keep a copy of the input eta value for scenarios where eta is modified downstream
+        # like in DulzPlavchan PlanetPopulation
+        self.input_eta = eta
         self.eta = eta
 
         # populate outspec with all inputs
